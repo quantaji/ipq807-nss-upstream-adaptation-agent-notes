@@ -1,0 +1,78 @@
+diff -u -r a/ipq807x/edma_rx.c b/ipq807x/edma_rx.c
+--- a/ipq807x/edma_rx.c	2026-11-19 00:34:40.100787047 -0700
++++ b/ipq807x/edma_rx.c	2026-11-19 00:34:40.103054771 -0700
+@@ -20,6 +20,18 @@
+ #include "ppe.h"
+ #include "edma_regs.h"
+ 
++/* E-0004 experiment only: this file reads and writes its registers directly.
++ * Through the register map every access takes the one lock of that map, with
++ * interrupts off, on whichever CPU it runs; all of them are single reads and
++ * writes of registers of one ring, which need no lock.
++ */
++#include <linux/io.h>
++
++#define regmap_read(map, reg, val) \
++	do { (void)(map); *(val) = readl(exp_mmio_base + (reg)); } while (0)
++#define regmap_write(map, reg, val) \
++	do { (void)(map); writel((val), exp_mmio_base + (reg)); } while (0)
++
+ /* How many slots of frames spread over several buffers each RX ring logs */
+ #define EDMA_RX_FRAME_LOG_MAX 80
+ 
+diff -u -r a/ipq807x/edma_tx.c b/ipq807x/edma_tx.c
+--- a/ipq807x/edma_tx.c	2026-11-19 00:34:40.100744481 -0700
++++ b/ipq807x/edma_tx.c	2026-11-19 00:34:40.103135790 -0700
+@@ -18,6 +18,18 @@
+ #include "ppe.h"
+ #include "edma_regs.h"
+ 
++/* E-0004 experiment only: this file reads and writes its registers directly.
++ * Through the register map every access takes the one lock of that map, with
++ * interrupts off, on whichever CPU it runs; all of them are single reads and
++ * writes of registers of one ring, which need no lock.
++ */
++#include <linux/io.h>
++
++#define regmap_read(map, reg, val) \
++	do { (void)(map); *(val) = readl(exp_mmio_base + (reg)); } while (0)
++#define regmap_write(map, reg, val) \
++	do { (void)(map); writel((val), exp_mmio_base + (reg)); } while (0)
++
+ /* This register does not read back what was written to it, so it is only
+  * ever written as a whole. @ring is a TX completion ring.
+  */
+diff -u -r a/ipq807x/ppe.c b/ipq807x/ppe.c
+--- a/ipq807x/ppe.c	2026-11-19 00:34:40.100811601 -0700
++++ b/ipq807x/ppe.c	2026-11-19 00:34:40.103199184 -0700
+@@ -28,6 +28,9 @@
+ 	.max_register = PPE_REG_SPACE_SIZE - 4,
+ };
+ 
++/* E-0004 experiment only */
++void __iomem *exp_mmio_base;
++
+ static void ppe_clk_disable(struct ppe_device *ppe_dev)
+ {
+ 	int i;
+@@ -101,6 +104,7 @@
+ 		return dev_err_probe(dev, PTR_ERR(base),
+ 				     "cannot map the registers\n");
+ 
++	exp_mmio_base = base;
+ 	ppe_dev->regmap = devm_regmap_init_mmio(dev, base, &ppe_regmap_cfg);
+ 	if (IS_ERR(ppe_dev->regmap))
+ 		return dev_err_probe(dev, PTR_ERR(ppe_dev->regmap),
+diff -u -r a/ipq807x/ppe.h b/ipq807x/ppe.h
+--- a/ipq807x/ppe.h	2026-11-19 00:34:40.100767415 -0700
++++ b/ipq807x/ppe.h	2026-11-19 00:34:40.103249954 -0700
+@@ -272,6 +272,9 @@
+ extern const struct phylink_mac_ops ppe_port_phylink_mac_ops;
+ 
+ /* ppe_netdev.c */
++/* E-0004 experiment only: where the registers are mapped */
++extern void __iomem *exp_mmio_base;
++
+ int ppe_netdev_alloc_all(struct ppe_device *ppe_dev);
+ int ppe_netdev_register_all(struct ppe_device *ppe_dev);
+ void ppe_netdev_unregister_all(struct ppe_device *ppe_dev);

@@ -1,0 +1,151 @@
+diff -u -r a/ipq807x/edma.c b/ipq807x/edma.c
+--- a/ipq807x/edma.c	2026-11-19 06:09:28.146807238 -0700
++++ b/ipq807x/edma.c	2026-11-19 06:09:28.148096844 -0700
+@@ -18,6 +18,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/if_vlan.h>
+ #include <linux/interrupt.h>
++#include <linux/module.h>
+ #include <linux/netdevice.h>
+ #include <linux/of.h>
+ #include <linux/of_irq.h>
+@@ -27,6 +28,72 @@
+ #include "ppe.h"
+ #include "edma_regs.h"
+ 
++/* E-0004 experiment only: reading the parameter exp_rings gives the misc
++ * status word and mask and, for each of the host's TX rings and TX
++ * completion rings, where the hardware and the driver stand in it.
++ */
++static struct ppe_device *exp_ppe_dev;
++
++static int exp_rings_get(char *buf, const struct kernel_param *kp)
++{
++	const struct ppe_soc_data *soc;
++	struct edma_ring *ring;
++	struct regmap *regmap;
++	u32 prod, cons, ctrl;
++	int i, held, slot;
++	int len = 0;
++
++	if (!exp_ppe_dev)
++		return -ENODEV;
++
++	soc = exp_ppe_dev->soc;
++	regmap = exp_ppe_dev->regmap;
++
++	regmap_read(regmap, EDMA_BASE_OFFSET + EDMA_REG_MISC_INT_STAT, &prod);
++	regmap_read(regmap, EDMA_BASE_OFFSET + EDMA_REG_MISC_INT_MASK, &cons);
++	len += sysfs_emit_at(buf, len, "misc stat %#x mask %#x\n", prod, cons);
++
++	for (i = 0; i < ARRAY_SIZE(exp_ppe_dev->edma.txdesc); i++) {
++		ring = &exp_ppe_dev->edma.txdesc[i];
++		if (!ring->desc)
++			continue;
++
++		regmap_read(regmap, EDMA_BASE_OFFSET +
++			    EDMA_REG_TXDESC_PROD_IDX(ring->id), &prod);
++		regmap_read(regmap, EDMA_BASE_OFFSET +
++			    EDMA_REG_TXDESC_CONS_IDX(ring->id), &cons);
++		regmap_read(regmap, EDMA_BASE_OFFSET +
++			    EDMA_REG_TXDESC_CTRL(ring->id), &ctrl);
++		held = 0;
++		for (slot = 0; slot < ring->count; slot++)
++			if (ring->skb_store[slot])
++				held++;
++		len += sysfs_emit_at(buf, len,
++				     "tx %u q%d prod %u cons %u ctrl %#x held %d\n",
++				     ring->id, ring->queue, prod, cons, ctrl,
++				     held);
++	}
++
++	for (i = 0; i < exp_ppe_dev->edma.num_txcmpl; i++) {
++		ring = &exp_ppe_dev->edma.txcmpl[i];
++		regmap_read(regmap, EDMA_BASE_OFFSET +
++			    EDMA_REG_TXCMPL_PROD_IDX(soc->edma_txcmpl_base,
++						     ring->id), &prod);
++		regmap_read(regmap, EDMA_BASE_OFFSET +
++			    EDMA_REG_TXCMPL_CONS_IDX(soc->edma_txcmpl_base,
++						     ring->id), &cons);
++		len += sysfs_emit_at(buf, len, "txcmpl %u prod %u cons %u\n",
++				     ring->id, prod, cons);
++	}
++
++	return len;
++}
++
++static const struct kernel_param_ops exp_rings_ops = {
++	.get = exp_rings_get,
++};
++module_param_cb(exp_rings, &exp_rings_ops, NULL, 0444);
++
+ /* Bring the whole EDMA to a known state: reset it, mask every ring
+  * interrupt, switch every ring and the block itself off, and write the two
+  * settings that are not a ring's. This is the one place that touches rings
+@@ -624,6 +691,7 @@
+ 		edma_rx_irq_set(&edma->rxdesc[i], true);
+ 
+ 	of_node_put(np);
++	exp_ppe_dev = ppe_dev;
+ 
+ 	return 0;
+ 
+@@ -657,6 +725,8 @@
+ 	struct edma *edma = &ppe_dev->edma;
+ 	int i;
+ 
++	exp_ppe_dev = NULL;
++
+ 	for (i = 0; i < edma->num_txcmpl; i++)
+ 		edma_tx_irq_set(&edma->txcmpl[i], false);
+ 	for (i = 0; i < edma->num_rx; i++)
+diff -u -r a/ipq807x/ppe.c b/ipq807x/ppe.c
+--- a/ipq807x/ppe.c	2026-11-19 06:09:28.146925601 -0700
++++ b/ipq807x/ppe.c	2026-11-19 06:09:28.148114824 -0700
+@@ -182,7 +182,7 @@
+ 	.edma_tx_rings_xgmac	= 4,
+ 	.edma_tx_rings_gmac	= 2,
+ 	.edma_host_queue_base	= 16,
+-	.max_mtu		= 12262,
++	.max_mtu		= 16357,
+ 	.edma_tx_min_size	= 33,
+ 	.edma_misc_int_mask	= 0x1ff,
+ };
+diff -u -r a/ipq807x/ppe_config.c b/ipq807x/ppe_config.c
+--- a/ipq807x/ppe_config.c	2026-11-19 06:09:28.146981882 -0700
++++ b/ipq807x/ppe_config.c	2026-11-19 06:09:28.165467976 -0700
+@@ -286,7 +286,10 @@
+ 	int i;
+ 
+ 	for (i = 0; i < PPE_BM_PORTS; i++) {
+-		bool fc_en = i > d->bm_phy_end;
++		/* E-0004 experiment only: flow control for the CPU side as well,
++		 * as it was before, to see whether the longest frames need it
++		 */
++		bool fc_en = (i < PPE_BM_PHY_START || i > d->bm_phy_end);
+ 
+ 		regmap_write(ppe_dev->regmap, PPE_BM_FC_MODE(i),
+ 			     fc_en ? PPE_BM_FC_EN : 0);
+diff -u -r a/ipq807x/ppe_port.c b/ipq807x/ppe_port.c
+--- a/ipq807x/ppe_port.c	2026-11-19 06:09:28.146828574 -0700
++++ b/ipq807x/ppe_port.c	2026-11-19 06:09:28.148131155 -0700
+@@ -564,6 +564,7 @@
+ 			   PPE_XGMAC_WATCHDOG_DISABLE |
+ 			   PPE_XGMAC_GIANT_SIZE_LIMIT,
+ 			   PPE_XGMAC_GMII_MPLS_LAYER_CK |
++			   PPE_XGMAC_WATCHDOG_DISABLE |
+ 			   FIELD_PREP(PPE_XGMAC_GIANT_SIZE_LIMIT,
+ 				      PPE_MAX_FRAME_SIZE));
+ 
+diff -u -r a/ipq807x/ppe_regs.h b/ipq807x/ppe_regs.h
+--- a/ipq807x/ppe_regs.h	2026-11-19 06:09:28.146853493 -0700
++++ b/ipq807x/ppe_regs.h	2026-11-19 06:09:28.148146344 -0700
+@@ -442,7 +442,7 @@
+ #define PPE_VSI_MAX			32
+ #define PPE_VSI_INVALID			U32_MAX
+ #define PPE_DEFAULT_MTU			1514
+-#define PPE_MAX_FRAME_SIZE		12288
++#define PPE_MAX_FRAME_SIZE		16383
+ #define PPE_AGE_UNIT_MS			8000
+ 
+ #define PPE_FDB_TBL_NUM			2048

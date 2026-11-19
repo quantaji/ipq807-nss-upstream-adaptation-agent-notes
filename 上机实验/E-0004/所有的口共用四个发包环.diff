@@ -1,0 +1,566 @@
+diff -u -r a/ipq807x/edma.c b/ipq807x/edma.c
+--- a/ipq807x/edma.c	2026-11-19 00:48:27.302318320 -0700
++++ b/ipq807x/edma.c	2026-11-19 00:48:27.303654234 -0700
+@@ -114,9 +114,9 @@
+ 	for (q = 0; q < edma->num_txcmpl; q++)
+ 		edma_tx_irq_set(&edma->txcmpl[q], false);
+ 
+-	for (i = 0; i < ARRAY_SIZE(edma->txdesc_by_id); i++) {
+-		ring = edma->txdesc_by_id[i];
+-		if (ring)
++	for (i = 0; i < ARRAY_SIZE(edma->txdesc); i++) {
++		ring = &edma->txdesc[i];
++		if (ring->desc)
+ 			regmap_clear_bits(regmap, EDMA_BASE_OFFSET +
+ 					  EDMA_REG_TXDESC_CTRL(ring->id),
+ 					  EDMA_TXDESC_TX_EN);
+@@ -139,9 +139,9 @@
+ 				EDMA_RXFILL_RING_EN);
+ 	}
+ 
+-	for (i = 0; i < ARRAY_SIZE(edma->txdesc_by_id); i++) {
+-		ring = edma->txdesc_by_id[i];
+-		if (ring)
++	for (i = 0; i < ARRAY_SIZE(edma->txdesc); i++) {
++		ring = &edma->txdesc[i];
++		if (ring->desc)
+ 			regmap_set_bits(regmap, EDMA_BASE_OFFSET +
+ 					EDMA_REG_TXDESC_CTRL(ring->id),
+ 					EDMA_TXDESC_TX_EN);
+@@ -170,9 +170,9 @@
+ 				   ring->fill->id << shift);
+ 	}
+ 
+-	for (i = 0; i < ARRAY_SIZE(edma->txdesc_by_id); i++) {
+-		ring = edma->txdesc_by_id[i];
+-		if (!ring)
++	for (i = 0; i < ARRAY_SIZE(edma->txdesc); i++) {
++		ring = &edma->txdesc[i];
++		if (!ring->desc)
+ 			continue;
+ 
+ 		shift = (ring->id % EDMA_RING_MAP_PER_REG) * EDMA_RING_MAP_BITS;
+diff -u -r a/ipq807x/edma_tx.c b/ipq807x/edma_tx.c
+--- a/ipq807x/edma_tx.c	2026-11-19 00:48:27.302459184 -0700
++++ b/ipq807x/edma_tx.c	2026-11-19 00:48:27.303694787 -0700
+@@ -3,10 +3,11 @@
+  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+  * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+  *
+- * EDMA transmit side. Every port has its own TX rings, one for each of its
+- * netdev's TX queues, into which the driver puts packets. The hardware
+- * reports sent packets in a TX completion ring; there is one of those for
+- * each TX queue number, shared by all ports. The ring handling is carried
++ * EDMA transmit side. The driver puts packets into TX rings: TX queue n of a
++ * port's netdev goes into one TX ring, which is either the n-th of the TX
++ * rings all ports share, one for each CPU, or the n-th of the port's own. The
++ * hardware reports sent packets in a TX completion ring; there is one of
++ * those for each TX queue number, for all ports. The ring handling is carried
+  * over from qca_edma.c.
+  */
+ 
+@@ -54,30 +55,37 @@
+ 	return IRQ_HANDLED;
+ }
+ 
+-/* The TX ring a packet of port @port_id with TX queue @queue goes into. The
+- * number of TX rings a port has and this function are all that says how
+- * packets are spread over TX rings.
+- */
+-struct edma_ring *edma_tx_ring_get(struct ppe_device *ppe_dev, int port_id,
+-				   int queue)
+-{
+-	return &ppe_dev->edma.txdesc[port_id][queue];
+-}
+-
+-/* The hardware's number for a port's TX ring. The host's TX rings are the
+- * highest numbered ones, handed out by port number whether or not the board
+- * has the port: with two for each of the six ports that have a MAC, port 1
+- * has rings 12 and 13 and port 6 rings 22 and 23.
++/* The hardware's number for the TX ring that TX queue @queue of port
++ * @port_id goes into. The number in the SoC's data and this function are all
++ * that says how packets are spread over TX rings. The host's TX rings are the
++ * highest numbered ones.
++ *
++ * When the ports share the TX rings there is one for each CPU, and TX queue
++ * n of every port goes into the n-th: with four CPUs rings 20 to 23.
++ *
++ * When every port has TX rings of its own they are handed out by port number
++ * whether or not the board has the port: with two for each of the six ports
++ * that have a MAC, port 1 has rings 12 and 13 and port 6 rings 22 and 23.
+  */
+ static int edma_tx_ring_id(struct ppe_device *ppe_dev, int port_id, int queue)
+ {
+ 	const struct ppe_soc_data *soc = ppe_dev->soc;
+ 
++	if (!soc->edma_tx_rings_per_port)
++		return soc->edma_num_txdesc_rings - ppe_dev->num_rx_groups +
++		       queue;
++
+ 	return soc->edma_num_txdesc_rings -
+ 	       (soc->num_gmacs - port_id + 1) * soc->edma_tx_rings_per_port +
+ 	       queue;
+ }
+ 
++struct edma_ring *edma_tx_ring_get(struct ppe_device *ppe_dev, int port_id,
++				   int queue)
++{
++	return &ppe_dev->edma.txdesc[edma_tx_ring_id(ppe_dev, port_id, queue)];
++}
++
+ int edma_tx_rings_alloc(struct ppe_device *ppe_dev)
+ {
+ 	const struct ppe_soc_data *soc = ppe_dev->soc;
+@@ -109,8 +117,12 @@
+ 
+ 		for (q = 0; q < port->num_txq; q++) {
+ 			ring = edma_tx_ring_get(ppe_dev, i, q);
++
++			/* A ring the ports share: an earlier port's */
++			if (ring->desc)
++				continue;
++
+ 			ring->id = edma_tx_ring_id(ppe_dev, i, q);
+-			ring->netdev = port->netdev;
+ 			ring->queue = q;
+ 			spin_lock_init(&ring->lock);
+ 
+@@ -119,8 +131,6 @@
+ 			if (ret)
+ 				goto err;
+ 
+-			edma->txdesc_by_id[ring->id] = ring;
+-
+ 			ring->skb_store = kcalloc(EDMA_TX_RING_SIZE,
+ 						  sizeof(struct sk_buff *),
+ 						  GFP_KERNEL);
+@@ -149,9 +159,9 @@
+ 	struct sk_buff *skb;
+ 	int i, slot;
+ 
+-	for (i = 0; i < ARRAY_SIZE(edma->txdesc_by_id); i++) {
+-		ring = edma->txdesc_by_id[i];
+-		if (!ring)
++	for (i = 0; i < ARRAY_SIZE(edma->txdesc); i++) {
++		ring = &edma->txdesc[i];
++		if (!ring->desc)
+ 			continue;
+ 
+ 		desc = ring->desc;
+@@ -169,7 +179,6 @@
+ 		kfree(ring->skb_store);
+ 		ring->skb_store = NULL;
+ 		edma_ring_free(ppe_dev, ring);
+-		edma->txdesc_by_id[i] = NULL;
+ 	}
+ 
+ 	for (i = 0; i < edma->num_txcmpl; i++)
+@@ -185,9 +194,9 @@
+ 	u32 cons;
+ 	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(edma->txdesc_by_id); i++) {
+-		ring = edma->txdesc_by_id[i];
+-		if (!ring)
++	for (i = 0; i < ARRAY_SIZE(edma->txdesc); i++) {
++		ring = &edma->txdesc[i];
++		if (!ring->desc)
+ 			continue;
+ 
+ 		regmap_write(regmap,
+@@ -259,14 +268,16 @@
+ 	return (cons - prod - 1) & (ring->count - 1);
+ }
+ 
+-/* Stop the netdev queue a TX ring serves because the ring is full or nearly
+- * so. The completion poll wakes it without taking the ring's lock, so look
+- * again afterwards: it may have made room just before the queue was stopped.
++/* Stop a port's TX queue because its TX ring is full or nearly so. Only the
++ * queue that ran into the full ring is stopped; other ports whose queues go
++ * into the same ring stop when they run into it themselves. The completion
++ * poll wakes the queue without taking the ring's lock, so look again
++ * afterwards: it may have made room just before the queue was stopped.
+  */
+-static void edma_tx_queue_stop(struct edma_ring *ring,
++static void edma_tx_queue_stop(struct edma_ring *ring, struct ppe_port *port,
+ 			       struct netdev_queue *txq)
+ {
+-	ring->tx_stopped++;
++	port->tx_ring_stopped[ring->queue]++;
+ 	netif_tx_stop_queue(txq);
+ 	smp_mb();
+ 	if (edma_tx_ring_free_slots(ring) > EDMA_TX_RING_THRESH)
+@@ -309,7 +320,7 @@
+ 	 * again as it is
+ 	 */
+ 	if (next == cons || ring->skb_store[prod]) {
+-		edma_tx_queue_stop(ring, txq);
++		edma_tx_queue_stop(ring, port, txq);
+ 		spin_unlock(&ring->lock);
+ 		return NETDEV_TX_BUSY;
+ 	}
+@@ -347,7 +358,7 @@
+ 				   EDMA_TXDESC_DATA_OFFSET_SHIFT) |
+ 				  (len & EDMA_TXDESC_DATA_LENGTH_MASK));
+ 
+-	ring->tx_packets++;
++	port->tx_ring_packets[queue]++;
+ 
+ 	/* "Sent" is noted before the hardware can see the packet: once it
+ 	 * can, it may report the packet as sent at any moment, and a
+@@ -362,7 +373,7 @@
+ 		     next);
+ 
+ 	if (((cons - next - 1) & (ring->count - 1)) < EDMA_TX_RING_THRESH)
+-		edma_tx_queue_stop(ring, txq);
++		edma_tx_queue_stop(ring, port, txq);
+ 
+ 	spin_unlock(&ring->lock);
+ 
+@@ -379,17 +390,19 @@
+ 	const struct ppe_soc_data *soc = ppe_dev->soc;
+ 	struct edma *edma = &ppe_dev->edma;
+ 	struct regmap *regmap = ppe_dev->regmap;
+-	unsigned int pkts[EDMA_NUM_TXDESC_RINGS] = {};
+-	unsigned int bytes[EDMA_NUM_TXDESC_RINGS] = {};
+-	unsigned long rings_seen = 0;
++	int queue = cmpl_ring - edma->txcmpl;
++	unsigned int pkts[PPE_NUM_PORTS] = {};
++	unsigned int bytes[PPE_NUM_PORTS] = {};
+ 	struct netdev_queue *txq;
+ 	struct edma_txdesc *txdesc;
+ 	struct edma_txcmpl *cmpl;
+ 	struct edma_ring *ring;
++	struct ppe_port *port;
+ 	struct sk_buff *skb;
+ 	u32 val, opaque, ring_id, slot;
+ 	u16 prod, cons;
+ 	int done = 0;
++	int i;
+ 
+ 	regmap_read(regmap,
+ 		    EDMA_BASE_OFFSET +
+@@ -413,9 +426,10 @@
+ 		ring_id = opaque >> EDMA_TX_OPAQUE_RING_SHIFT;
+ 		slot = opaque & EDMA_TX_OPAQUE_SLOT_MASK;
+ 
+-		ring = ring_id < ARRAY_SIZE(edma->txdesc_by_id) ?
+-		       edma->txdesc_by_id[ring_id] : NULL;
+-		skb = ring && slot < ring->count ? ring->skb_store[slot] : NULL;
++		ring = ring_id < ARRAY_SIZE(edma->txdesc) ?
++		       &edma->txdesc[ring_id] : NULL;
++		skb = ring && ring->skb_store && slot < ring->count ?
++		      ring->skb_store[slot] : NULL;
+ 		if (unlikely(!skb)) {
+ 			dev_warn_ratelimited(ppe_dev->dev,
+ 					     "TX completion %#010x, which holds no packet\n",
+@@ -426,10 +440,13 @@
+ 			dma_unmap_single(ppe_dev->dev,
+ 					 le32_to_cpu(txdesc[slot].buffer_addr),
+ 					 skb->len, DMA_TO_DEVICE);
+-			pkts[ring_id]++;
+-			bytes[ring_id] += skb->len - EDMA_PREHDR_SIZE;
++			/* The ring may be several ports'; the packet says
++			 * which port's it is
++			 */
++			port = netdev_priv(skb->dev);
++			pkts[port->port_id]++;
++			bytes[port->port_id] += skb->len - EDMA_PREHDR_SIZE;
+ 			napi_consume_skb(skb, budget);
+-			rings_seen |= BIT(ring_id);
+ 		}
+ 
+ 		if (++cons == cmpl_ring->count)
+@@ -438,35 +455,49 @@
+ 		done++;
+ 	}
+ 
+-	if (done) {
+-		/* The entries have been dealt with before the hardware is
+-		 * told so
+-		 */
+-		wmb();
+-		regmap_write(regmap,
+-			     EDMA_BASE_OFFSET +
+-			     EDMA_REG_TXCMPL_CONS_IDX(soc->edma_txcmpl_base,
+-						      cmpl_ring->id),
+-			     cons);
+-	}
++	if (!done)
++		return 0;
+ 
+-	/* What this round took out of a TX ring is reported to the stack in
+-	 * one go: the byte queue limits size the queue by how much one round
+-	 * completes, so a report per packet shrinks the limit to two packets.
+-	 * A TX ring that packets were taken out of may also have room again.
++	/* The entries have been dealt with before the hardware is told so */
++	wmb();
++	regmap_write(regmap,
++		     EDMA_BASE_OFFSET +
++		     EDMA_REG_TXCMPL_CONS_IDX(soc->edma_txcmpl_base,
++					      cmpl_ring->id),
++		     cons);
++
++	/* This completion ring reports for the TX ring of every port's TX
++	 * queue of its number. What this round completed for a port is
++	 * reported to the stack in one go: the byte queue limits size the
++	 * queue by how much one round completes, so a report per packet
++	 * shrinks the limit to two packets.
++	 *
++	 * Every port's queue is looked at for waking, not only those that
++	 * had packets completed: where ports share a TX ring, a queue may
++	 * have been stopped by a ring full of other ports' packets. A queue
++	 * is woken whatever its link: one stopped while the link was down
++	 * would otherwise stay stopped once the ring has drained, with no
++	 * completion left to wake it. A port that has been closed keeps its
++	 * queues stopped.
++	 *
+ 	 * The barrier pairs with the one in edma_tx_queue_stop(): either that
+ 	 * sees the emptied slots or the stopped queue is seen here.
+ 	 */
+ 	smp_mb();
+-	for_each_set_bit(ring_id, &rings_seen, EDMA_NUM_TXDESC_RINGS) {
+-		ring = edma->txdesc_by_id[ring_id];
+-		txq = netdev_get_tx_queue(ring->netdev, ring->queue);
+-
+-		netdev_tx_completed_queue(txq, pkts[ring_id], bytes[ring_id]);
+-
+-		if (netif_tx_queue_stopped(txq) &&
+-		    netif_carrier_ok(ring->netdev) &&
+-		    edma_tx_ring_free_slots(ring) > EDMA_TX_RING_THRESH)
++	for (i = 0; i < ARRAY_SIZE(ppe_dev->ports); i++) {
++		port = ppe_dev->ports[i];
++		if (!port || queue >= port->num_txq)
++			continue;
++
++		txq = netdev_get_tx_queue(port->netdev, queue);
++		if (pkts[i])
++			netdev_tx_completed_queue(txq, pkts[i], bytes[i]);
++
++		if (!netif_tx_queue_stopped(txq) || !netif_running(port->netdev))
++			continue;
++
++		ring = edma_tx_ring_get(ppe_dev, i, queue);
++		if (edma_tx_ring_free_slots(ring) > EDMA_TX_RING_THRESH)
+ 			netif_tx_wake_queue(txq);
+ 	}
+ 
+diff -u -r a/ipq807x/ppe.c b/ipq807x/ppe.c
+--- a/ipq807x/ppe.c	2026-11-19 00:48:27.302415411 -0700
++++ b/ipq807x/ppe.c	2026-11-19 00:48:27.303661738 -0700
+@@ -106,6 +106,12 @@
+ 		return dev_err_probe(dev, PTR_ERR(ppe_dev->regmap),
+ 				     "cannot create the register map\n");
+ 
++	/* One RX ring, and one PPE queue to feed it, for each CPU there is.
++	 * The netdevs need the number for their TX queues.
++	 */
++	ppe_dev->num_rx_groups = min_t(unsigned int, num_online_cpus(),
++				       ppe_dev->soc->edma_max_rx_groups);
++
+ 	ret = ppe_netdev_alloc_all(ppe_dev);
+ 	if (ret)
+ 		return ret;
+@@ -114,10 +120,6 @@
+ 	if (ret)
+ 		goto err_netdev;
+ 
+-	/* One RX ring, and one PPE queue to feed it, for each CPU there is */
+-	ppe_dev->num_rx_groups = min_t(unsigned int, num_online_cpus(),
+-				       ppe_dev->soc->edma_max_rx_groups);
+-
+ 	ppe_hw_config(ppe_dev);
+ 
+ 	ret = edma_setup(ppe_dev);
+@@ -184,7 +186,7 @@
+ 	.edma_num_rxfill_rings	= 8,
+ 	.edma_num_rxdesc_rings	= 16,
+ 	.edma_max_rx_groups	= 4,
+-	.edma_tx_rings_per_port	= 2,
++	.edma_tx_rings_per_port	= 0,
+ 	.edma_host_queue_base	= 16,
+ 	.max_mtu		= 12262,
+ 	.edma_tx_min_size	= 33,
+diff -u -r a/ipq807x/ppe.h b/ipq807x/ppe.h
+--- a/ipq807x/ppe.h	2026-11-19 00:48:27.302377848 -0700
++++ b/ipq807x/ppe.h	2026-11-19 00:48:27.303637970 -0700
+@@ -64,8 +64,10 @@
+ 	 * one RX ring and one RX fill ring for each CPU, up to this many, ...
+ 	 */
+ 	u8 edma_max_rx_groups;
+-	/* ... this many TX rings for every port, and as many TX completion
+-	 * rings as a port has TX rings.
++	/* ... and for sending either one TX ring for each CPU, which all
++	 * ports share (0 here), or this many TX rings of its own for every
++	 * port. Either way there are as many TX completion rings as a port
++	 * has TX queues.
+ 	 */
+ 	u8 edma_tx_rings_per_port;
+ 	/* The first of the PPE queues that carry packets for the host. They
+@@ -90,6 +92,10 @@
+ 	u64 last;
+ };
+ 
++#define EDMA_MAX_RX_GROUPS	4
++#define EDMA_MAX_TX_QUEUES	4
++#define EDMA_NUM_TXDESC_RINGS	24
++
+ /* One front-panel port. This is the private data of the port's netdev. */
+ struct ppe_port {
+ 	struct ppe_device *ppe_dev;
+@@ -102,8 +108,14 @@
+ 	struct phylink_config phylink_config;
+ 	/* The speed the MAC was last brought up at; 0 before the first link */
+ 	int mac_speed;
+-	/* How many TX queues, and with them TX rings, the port has */
++	/* How many TX queues the port has. Each one goes into a TX ring. */
+ 	u8 num_txq;
++	/* For each TX queue: how many packets the port put into the queue's
++	 * TX ring, and how often the queue was stopped because that ring was
++	 * full
++	 */
++	u64 tx_ring_packets[EDMA_MAX_TX_QUEUES];
++	u64 tx_ring_stopped[EDMA_MAX_TX_QUEUES];
+ 
+ 	/* MAC counters: what has been added up so far and what each counter
+ 	 * read the last time. The GMAC's and the XGMAC's counters are apart,
+@@ -123,10 +135,6 @@
+ 	struct reset_control *rst;
+ };
+ 
+-#define EDMA_MAX_RX_GROUPS	4
+-#define EDMA_MAX_TX_QUEUES	4
+-#define EDMA_NUM_TXDESC_RINGS	24
+-
+ /* One EDMA ring. Which of the fields below are used depends on the kind of
+  * ring.
+  */
+@@ -164,16 +172,15 @@
+ 	u64 rx_nobuf;
+ 	u64 rx_frame_err;
+ 
+-	/* TX ring: the packet in each slot, and the netdev queue it serves.
+-	 * The lock is for the netdevs' xmit only; a completion is taken by
+-	 * one poll at a time.
++	/* TX ring: the packet in each slot, and which TX queue of its port,
++	 * or of every port when the ports share it, goes into it. The lock
++	 * is for the netdevs' xmit only: the TX queues of several ports may
++	 * put packets in at once. A completion is taken by one poll at a
++	 * time.
+ 	 */
+ 	struct sk_buff **skb_store;
+ 	spinlock_t lock;
+-	struct net_device *netdev;
+ 	u8 queue;
+-	u64 tx_packets;
+-	u64 tx_stopped;
+ };
+ 
+ struct edma {
+@@ -188,14 +195,13 @@
+ 	struct edma_ring rxdesc[EDMA_MAX_RX_GROUPS];
+ 	struct edma_ring rxfill[EDMA_MAX_RX_GROUPS];
+ 
+-	/* TX rings by port and by the port's TX queue; TX completion rings
+-	 * by TX queue: completion ring n reports for every port's TX ring n.
++	/* TX rings by their number in the hardware; one the host does not
++	 * use has no slots. TX completion rings by TX queue: completion ring
++	 * n reports for the TX ring of every port's TX queue n.
+ 	 */
+ 	u8 num_txcmpl;
+-	struct edma_ring txdesc[PPE_NUM_PORTS][EDMA_MAX_TX_QUEUES];
++	struct edma_ring txdesc[EDMA_NUM_TXDESC_RINGS];
+ 	struct edma_ring txcmpl[EDMA_MAX_TX_QUEUES];
+-	/* A TX ring by its number in the hardware */
+-	struct edma_ring *txdesc_by_id[EDMA_NUM_TXDESC_RINGS];
+ 
+ 	u32 rx_buffer_size;
+ 
+@@ -225,7 +231,9 @@
+ 
+ 	/* Indexed by PPE port number; NULL where the board has no port */
+ 	struct ppe_port *ports[PPE_NUM_PORTS];
+-	/* How many CPUs get an RX ring and a PPE queue of their own */
++	/* How many CPUs get an RX ring and a PPE queue of their own, and,
++	 * when the ports share the TX rings, a TX ring of their own
++	 */
+ 	u8 num_rx_groups;
+ 
+ 	struct edma edma;
+diff -u -r a/ipq807x/ppe_netdev.c b/ipq807x/ppe_netdev.c
+--- a/ipq807x/ppe_netdev.c	2026-11-19 00:48:27.302403248 -0700
++++ b/ipq807x/ppe_netdev.c	2026-11-19 00:48:27.303687889 -0700
+@@ -15,7 +15,7 @@
+ 
+ /* Get one packet ready for the EDMA: one piece of memory that is the
+  * driver's alone, long enough for the hardware, with room in front for the
+- * pre-header. Then it goes into the TX ring every port shares.
++ * pre-header. Then it goes into the TX ring of its TX queue.
+  */
+ static netdev_tx_t ppe_netdev_xmit(struct sk_buff *skb,
+ 				   struct net_device *netdev)
+@@ -173,6 +173,7 @@
+ 	struct net_device *netdev;
+ 	struct ppe_port *port;
+ 	u32 port_id;
++	int num_txq;
+ 	int ret;
+ 
+ 	ret = of_property_read_u32(np, "reg", &port_id);
+@@ -188,8 +189,14 @@
+ 	if (!of_property_read_string(np, "label", &name))
+ 		name_type = NET_NAME_PREDICTABLE;
+ 
++	/* A TX queue for each TX ring the port can send into: one for each
++	 * CPU when the ports share the TX rings
++	 */
++	num_txq = ppe_dev->soc->edma_tx_rings_per_port ?:
++		  ppe_dev->num_rx_groups;
++
+ 	netdev = alloc_netdev_mqs(sizeof(*port), name, name_type, ether_setup,
+-				  ppe_dev->soc->edma_tx_rings_per_port, 1);
++				  num_txq, 1);
+ 	if (!netdev)
+ 		return -ENOMEM;
+ 
+@@ -198,7 +205,7 @@
+ 	port->netdev = netdev;
+ 	port->np = of_node_get(np);
+ 	port->port_id = port_id;
+-	port->num_txq = ppe_dev->soc->edma_tx_rings_per_port;
++	port->num_txq = num_txq;
+ 
+ 	ret = ppe_port_stats_alloc(port);
+ 	if (ret) {
+diff -u -r a/ipq807x/ppe_port.c b/ipq807x/ppe_port.c
+--- a/ipq807x/ppe_port.c	2026-11-19 00:48:27.302426634 -0700
++++ b/ipq807x/ppe_port.c	2026-11-19 00:48:27.303667924 -0700
+@@ -329,7 +329,7 @@
+ #undef MIB
+ 
+ /* ethtool -S: the MAC's counters, then what the driver counts for each RX
+- * ring, which all ports share, and for each of the port's own TX rings.
++ * ring, which all ports share, and for each of the port's TX queues.
+  */
+ int ppe_port_get_sset_count(struct ppe_port *port)
+ {
+@@ -359,7 +359,6 @@
+ void ppe_port_get_ethtool_stats(struct ppe_port *port, u64 *data)
+ {
+ 	struct edma *edma = &port->ppe_dev->edma;
+-	struct edma_ring *ring;
+ 	int i;
+ 
+ 	spin_lock_bh(&port->stats_lock);
+@@ -375,9 +374,8 @@
+ 	}
+ 
+ 	for (i = 0; i < port->num_txq; i++) {
+-		ring = edma_tx_ring_get(port->ppe_dev, port->port_id, i);
+-		*data++ = ring->tx_packets;
+-		*data++ = ring->tx_stopped;
++		*data++ = port->tx_ring_packets[i];
++		*data++ = port->tx_ring_stopped[i];
+ 	}
+ }
+ 

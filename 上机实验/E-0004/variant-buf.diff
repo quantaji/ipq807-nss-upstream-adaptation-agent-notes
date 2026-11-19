@@ -1,0 +1,63 @@
+diff -u -r a/ipq807x/edma_rx.c b/ipq807x/edma_rx.c
+--- a/ipq807x/edma_rx.c	2026-11-19 00:34:40.054747458 -0700
++++ b/ipq807x/edma_rx.c	2026-11-19 00:34:40.057200595 -0700
+@@ -13,6 +13,7 @@
+ #include <linux/etherdevice.h>
+ #include <linux/if_vlan.h>
+ #include <linux/interrupt.h>
++#include <linux/module.h>
+ #include <linux/netdevice.h>
+ #include <linux/skbuff.h>
+ #include <net/page_pool/helpers.h>
+@@ -20,6 +21,15 @@
+ #include "ppe.h"
+ #include "edma_regs.h"
+ 
++/* E-0004 experiment only. exp_fail_alloc: treat every attempt to get a new
++ * page in the RX poll as failed. exp_starve_ring: the RX ring of that index
++ * hands its frames up but puts no buffer back, so its fill ring drains.
++ */
++static bool exp_fail_alloc;
++module_param(exp_fail_alloc, bool, 0644);
++static int exp_starve_ring = -1;
++module_param(exp_starve_ring, int, 0644);
++
+ /* How many slots of frames spread over several buffers each RX ring logs */
+ #define EDMA_RX_FRAME_LOG_MAX 80
+ 
+@@ -388,6 +398,10 @@
+ 		}
+ 
+ 		new_page = page_pool_dev_alloc_pages(fill->page_pool);
++		if (exp_fail_alloc && new_page) {
++			page_pool_put_full_page(fill->page_pool, new_page, true);
++			new_page = NULL;
++		}
+ 		if (unlikely(!new_page)) {
+ 			/* No page to replace this one with: the frame goes
+ 			 * and the page goes back to the hardware as it is.
+@@ -406,8 +420,12 @@
+ 			goto drop_frame;
+ 		}
+ 
+-		edma_rx_fill_slot(fill, new_page, fill_prod, store_idx);
+-		fill_prod = (fill_prod + 1) & (fill->count - 1);
++		if (exp_starve_ring == ring - ppe_dev->edma.rxdesc) {
++			page_pool_put_full_page(fill->page_pool, new_page, true);
++		} else {
++			edma_rx_fill_slot(fill, new_page, fill_prod, store_idx);
++			fill_prod = (fill_prod + 1) & (fill->count - 1);
++		}
+ 
+ 		/* The rest of a frame that is being dropped */
+ 		if (unlikely(ring->frame_drop)) {
+@@ -534,7 +552,8 @@
+ 	if ((prod & (fill->count - 1)) == (cons & (fill->count - 1))) {
+ 		dev_warn_ratelimited(ring->ppe_dev->dev,
+ 				     "RX fill ring %u is empty\n", fill->id);
+-		edma_rx_fill(fill);
++		if (exp_starve_ring != ring - ring->ppe_dev->edma.rxdesc)
++			edma_rx_fill(fill);
+ 		return budget;
+ 	}
+ 

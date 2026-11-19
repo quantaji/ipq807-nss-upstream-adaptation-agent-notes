@@ -1,0 +1,146 @@
+diff -u -r a/ipq807x/ppe_config.c b/ipq807x/ppe_config.c
+--- a/ipq807x/ppe_config.c	2026-11-18 22:06:49.706795614 -0700
++++ b/ipq807x/ppe_config.c	2026-11-18 22:09:01.745422539 -0700
+@@ -6,6 +6,7 @@
+  * qca_ppe_scheduler.c and qca_ppe_main.c.
+  */
+ 
++#include <linux/module.h>
+ #include <linux/delay.h>
+ #include <linux/if_vlan.h>
+ #include <linux/random.h>
+@@ -962,8 +963,134 @@
+ }
+ 
+ /* Boot-time PPE configuration. The order is the order qca_ppe used. */
++/* E-0004 experiment only: two parameters that rewrite, while the driver runs,
++ * the buffer limits the PPE applies to what the host sends.
++ *
++ * exp_cpu_bm takes "fc ceiling react weight": for each of the eight buffer
++ * manager ports on the CPU side, whether a full port holds the host back (1)
++ * or has its frames dropped (0), and the port's three limits. The driver
++ * loads with "0 250 100 4".
++ *
++ * exp_uni_ac takes "ceiling weight": for every unicast queue, the two limits
++ * of how many buffers the queue may hold before frames for it are dropped.
++ * The driver loads with "400 4".
++ *
++ * Reading either gives what was last written to it.
++ */
++static struct ppe_device *exp_ppe_dev;
++static char exp_cpu_bm_now[32] = "0 250 100 4";
++static char exp_uni_ac_now[32] = "400 4";
++
++static int exp_cpu_bm_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int fc, ceiling, react, weight;
++	int i;
++
++	if (!exp_ppe_dev)
++		return -ENODEV;
++	if (sscanf(val, "%u %u %u %u", &fc, &ceiling, &react, &weight) != 4)
++		return -EINVAL;
++
++	for (i = 0; i < PPE_BM_PHY_START; i++) {
++		regmap_write(exp_ppe_dev->regmap, PPE_BM_FC_MODE(i),
++			     fc ? PPE_BM_FC_EN : 0);
++		regmap_write(exp_ppe_dev->regmap, PPE_BM_PORT_FC_W0(i),
++			     FIELD_PREP(PPE_BM_REACT_LIMIT, react) |
++			     FIELD_PREP(PPE_BM_RESUME_OFF, 36) |
++			     FIELD_PREP(PPE_BM_CEILING_LO, ceiling & 0x7));
++		regmap_write(exp_ppe_dev->regmap, PPE_BM_PORT_FC_W1(i),
++			     FIELD_PREP(PPE_BM_CEILING_HI, ceiling >> 3) |
++			     FIELD_PREP(PPE_BM_WEIGHT, weight) |
++			     PPE_BM_DYNAMIC);
++	}
++
++	snprintf(exp_cpu_bm_now, sizeof(exp_cpu_bm_now), "%u %u %u %u", fc,
++		 ceiling, react, weight);
++
++	return 0;
++}
++
++static int exp_cpu_bm_get(char *buf, const struct kernel_param *kp)
++{
++	return sysfs_emit(buf, "%s\n", exp_cpu_bm_now);
++}
++
++static const struct kernel_param_ops exp_cpu_bm_ops = {
++	.set = exp_cpu_bm_set,
++	.get = exp_cpu_bm_get,
++};
++module_param_cb(exp_cpu_bm, &exp_cpu_bm_ops, NULL, 0644);
++
++static int exp_uni_ac_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int ceiling, weight;
++	int i;
++
++	if (!exp_ppe_dev)
++		return -ENODEV;
++	if (sscanf(val, "%u %u", &ceiling, &weight) != 2)
++		return -EINVAL;
++
++	/* An entry has four words and the hardware takes it only when the
++	 * last one is written: all four go out, as at boot.
++	 */
++	for (i = 0; i < PPE_L0_UCAST_QUEUES; i++) {
++		regmap_write(exp_ppe_dev->regmap, PPE_QM_AC_UNI_W0(i),
++			     PPE_AC_EN |
++			     PPE_AC_SHARED_DYNAMIC |
++			     FIELD_PREP(PPE_AC_SHARED_WEIGHT, weight) |
++			     FIELD_PREP(PPE_AC_SHARED_CEILING, ceiling));
++		regmap_write(exp_ppe_dev->regmap, PPE_QM_AC_UNI_W1(i), 0);
++		regmap_write(exp_ppe_dev->regmap, PPE_QM_AC_UNI_W2(i), 0);
++		regmap_write(exp_ppe_dev->regmap, PPE_QM_AC_UNI_W3(i),
++			     FIELD_PREP(PPE_AC_GRN_RESUME_OFF, 36));
++	}
++
++	snprintf(exp_uni_ac_now, sizeof(exp_uni_ac_now), "%u %u", ceiling,
++		 weight);
++
++	return 0;
++}
++
++static int exp_uni_ac_get(char *buf, const struct kernel_param *kp)
++{
++	return sysfs_emit(buf, "%s\n", exp_uni_ac_now);
++}
++
++static const struct kernel_param_ops exp_uni_ac_ops = {
++	.set = exp_uni_ac_set,
++	.get = exp_uni_ac_get,
++};
++module_param_cb(exp_uni_ac, &exp_uni_ac_ops, NULL, 0644);
++
++/* exp_cpu_queue takes the number of a PPE queue. Frames that go to the CPU
++ * port without a reason of their own then start at that queue instead of the
++ * host's first one; the hash still adds 0 to 3. The driver loads with 16.
++ * This is how a frame is got into a queue the host does not use.
++ */
++static int exp_cpu_queue_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int queue;
++
++	if (!exp_ppe_dev)
++		return -ENODEV;
++	if (kstrtouint(val, 0, &queue) || queue > 252)
++		return -EINVAL;
++
++	ppe_qm_map_set(exp_ppe_dev, QM_VP_PORT_OFFSET + QCA_PPE_CPU_PORT, queue,
++		       QCA_PPE_CPU_PORT);
++
++	return 0;
++}
++
++static const struct kernel_param_ops exp_cpu_queue_ops = {
++	.set = exp_cpu_queue_set,
++};
++module_param_cb(exp_cpu_queue, &exp_cpu_queue_ops, NULL, 0200);
++
+ void ppe_hw_config(struct ppe_device *ppe_dev)
+ {
++	exp_ppe_dev = ppe_dev;
+ 	int i;
+ 
+ 	mutex_lock(&ppe_dev->config_lock);

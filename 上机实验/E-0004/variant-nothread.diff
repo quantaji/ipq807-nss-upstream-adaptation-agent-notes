@@ -1,0 +1,21 @@
+diff -u -r a/ipq807x/edma.c b/ipq807x/edma.c
+--- a/ipq807x/edma.c	2026-11-19 00:34:40.036387440 -0700
++++ b/ipq807x/edma.c	2026-11-19 00:34:40.040090408 -0700
+@@ -468,7 +468,7 @@
+ 		return -ENOMEM;
+ 	strscpy(edma->rx_napi_dev->name, "edma_rx",
+ 		sizeof(edma->rx_napi_dev->name));
+-	netif_threaded_enable(edma->rx_napi_dev);
++	/* E-0004 experiment only: the RX polls run as softirqs, not threads */
+ 
+ 	edma->tx_napi_dev = alloc_netdev_dummy(0);
+ 	if (!edma->tx_napi_dev) {
+@@ -477,7 +477,7 @@
+ 	}
+ 	strscpy(edma->tx_napi_dev->name, "edma_tx",
+ 		sizeof(edma->tx_napi_dev->name));
+-	netif_threaded_enable(edma->tx_napi_dev);
++	/* E-0004 experiment only: the TX completion polls run as softirqs */
+ 
+ 	for (i = 0; i < edma->num_rx; i++)
+ 		netif_napi_add(edma->rx_napi_dev, &edma->rxdesc[i].napi,

@@ -1,0 +1,69 @@
+diff -u -r a/ipq807x/edma.c b/ipq807x/edma.c
+--- a/ipq807x/edma.c	2026-11-19 00:34:40.069827703 -0700
++++ b/ipq807x/edma.c	2026-11-19 00:34:40.072453484 -0700
+@@ -18,6 +18,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/if_vlan.h>
+ #include <linux/interrupt.h>
++#include <linux/module.h>
+ #include <linux/netdevice.h>
+ #include <linux/of.h>
+ #include <linux/of_irq.h>
+@@ -27,6 +28,40 @@
+ #include "ppe.h"
+ #include "edma_regs.h"
+ 
++/* E-0004 experiment only: writing to the parameter exp_misc_trigger points
++ * TX ring 8, which nothing uses, at a bus address that does not exist and
++ * has the hardware fetch one packet from it.
++ */
++static struct ppe_device *exp_ppe_dev;
++
++static int exp_misc_trigger_set(const char *val, const struct kernel_param *kp)
++{
++	struct regmap *regmap;
++	u32 cons;
++
++	if (!exp_ppe_dev)
++		return -ENODEV;
++
++	regmap = exp_ppe_dev->regmap;
++	regmap_write(regmap, EDMA_BASE_OFFSET + EDMA_REG_TXDESC_BA(8),
++		     0xfffff000);
++	regmap_write(regmap, EDMA_BASE_OFFSET + EDMA_REG_TXDESC_RING_SIZE(8),
++		     EDMA_TX_RING_SIZE);
++	regmap_read(regmap, EDMA_BASE_OFFSET + EDMA_REG_TXDESC_CONS_IDX(8),
++		    &cons);
++	regmap_set_bits(regmap, EDMA_BASE_OFFSET + EDMA_REG_TXDESC_CTRL(8),
++			EDMA_TXDESC_TX_EN);
++	regmap_write(regmap, EDMA_BASE_OFFSET + EDMA_REG_TXDESC_PROD_IDX(8),
++		     (cons + 1) & (EDMA_TX_RING_SIZE - 1));
++
++	return 0;
++}
++
++static const struct kernel_param_ops exp_misc_trigger_ops = {
++	.set = exp_misc_trigger_set,
++};
++module_param_cb(exp_misc_trigger, &exp_misc_trigger_ops, NULL, 0200);
++
+ /* Bring the whole EDMA to a known state: reset it, mask every ring
+  * interrupt, switch every ring and the block itself off, and write the two
+  * settings that are not a ring's. This is the one place that touches rings
+@@ -624,6 +659,7 @@
+ 		edma_rx_irq_set(&edma->rxdesc[i], true);
+ 
+ 	of_node_put(np);
++	exp_ppe_dev = ppe_dev;
+ 
+ 	return 0;
+ 
+@@ -657,6 +693,8 @@
+ 	struct edma *edma = &ppe_dev->edma;
+ 	int i;
+ 
++	exp_ppe_dev = NULL;
++
+ 	for (i = 0; i < edma->num_txcmpl; i++)
+ 		edma_tx_irq_set(&edma->txcmpl[i], false);
+ 	for (i = 0; i < edma->num_rx; i++)

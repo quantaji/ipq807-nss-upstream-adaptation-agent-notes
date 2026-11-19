@@ -1,0 +1,13 @@
+diff -u -r a/ipq807x/ppe.c b/ipq807x/ppe.c
+--- a/ipq807x/ppe.c	2026-11-18 19:30:28.974816077 -0700
++++ b/ipq807x/ppe.c	2026-11-18 19:30:29.013352168 -0700
+@@ -185,7 +185,8 @@
+ 	.edma_num_rxdesc_rings	= 16,
+ 	.edma_max_rx_groups	= 4,
+ 	.edma_tx_ring_first	= 10,
+-	.edma_tx_rings_xgmac	= 4,
++	/* E-0004 experiment only: a port with a 10G MAC has two TX rings too */
++	.edma_tx_rings_xgmac	= 2,
+ 	.edma_tx_rings_gmac	= 2,
+ 	.edma_host_queue_base	= 16,
+ 	.max_mtu		= 12262,
