@@ -474,6 +474,10 @@
 
 - 这一件用的是决定-001 那一段里的登记 devlink 端口的地方的名单，不再印一遍。
 
+### 另外读到的资料
+
+- 用户给的资料（2026-11-21 转来的，没有在本地核）：这块板子已有的 PHY 接法没有可以用的物理拆口的依据。
+
 ## 决定-005　健康报告设几个、各管哪几种故障、挂在设备上还是挂在端口上
 
 ### 已经看得到的几种做法
@@ -627,6 +631,17 @@
   - **怎样回到"健康"**：归的类：有恢复的回调。nsim\_dev\_dummy\_reporter\_recover 在用户把 debugfs 的 fail\_recover 设成真时直接返回 -EINVAL 并给出 "User setup the recover to fail for testing purposes"；否则有上报现场时把这次的消息复制成 recovered\_break\_msg 存起来，返回 0，不碰任何硬件。 出处：[drivers/net/netdevsim/health.c 第 46 行](../../../references/upstream/linux/drivers/net/netdevsim/health.c#L46) `if (health->fail_recover) {`；[drivers/net/netdevsim/health.c 第 55 行](../../../references/upstream/linux/drivers/net/netdevsim/health.c#L55) `health->recovered_break_msg = kstrdup(ctx->break_msg,`
   - **宽限期、突发期，诊断、存现场、测试**：归的类：有诊断、有存现场。宽限期、突发期都没有填；诊断先给出上一次恢复存下的 recovered\_break\_message（有的话），再由 nsim\_dev\_dummy\_fmsg\_put 给出一组测试用的值（test\_bool、test\_u8、test\_u32、test\_u64、test\_string、binary\_len 字节的随机二进制 test\_binary、嵌套对象、0 到 9 的 u32 数组、对象数组）；存现场在有上报现场时先给 break\_message，再给同一组测试值；没有测试的回调。 出处：[drivers/net/netdevsim/health.c 第 129 行](../../../references/upstream/linux/drivers/net/netdevsim/health.c#L129) `devlink_fmsg_string_pair_put(fmsg, "recovered_break_message",`；[drivers/net/netdevsim/health.c 第 116 行](../../../references/upstream/linux/drivers/net/netdevsim/health.c#L116) `devlink_fmsg_string_pair_put(fmsg, "break_message", ctx->break_msg);`
 
+### 另外读到的资料
+
+- 驱动自己改健康报告状态的地方：在 `references/upstream/linux/drivers/` 里搜 `devlink_health_reporter_state_update`，6 处、5 个文件、4 个驱动。一处一行：
+  - [drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c 第 283 行](../../../references/upstream/linux/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c#L283) `devlink_health_reporter_state_update(fw_health->fw_reporter, state);`：这个函数由两处调，固件复位做完、恢复成了的时候改成"健康"（[drivers/net/ethernet/broadcom/bnxt/bnxt.c 第 15556 行](../../../references/upstream/linux/drivers/net/ethernet/broadcom/bnxt/bnxt.c#L15556) `bnxt_dl_health_fw_status_update(bp, true);`），固件复位中途放弃的时候改成"出错"（[drivers/net/ethernet/broadcom/bnxt/bnxt.c 第 15404 行](../../../references/upstream/linux/drivers/net/ethernet/broadcom/bnxt/bnxt.c#L15404) `bnxt_dl_health_fw_status_update(bp, false);`）。
+  - [drivers/net/ethernet/mellanox/mlx5/core/main.c 第 2130 行](../../../references/upstream/linux/drivers/net/ethernet/mellanox/mlx5/core/main.c#L2130) `devlink_health_reporter_state_update(dev->priv.health.fw_fatal_reporter,`：PCI 出错以后驱动把设备重新加载成了，把管固件致命错的报告改成"健康"。
+  - [drivers/net/ethernet/mellanox/mlx5/core/en/health.c 第 78 行](../../../references/upstream/linux/drivers/net/ethernet/mellanox/mlx5/core/en/health.c#L78) `devlink_health_reporter_state_update(priv->tx_reporter,`、[drivers/net/ethernet/mellanox/mlx5/core/en/health.c 第 81 行](../../../references/upstream/linux/drivers/net/ethernet/mellanox/mlx5/core/en/health.c#L81) `devlink_health_reporter_state_update(priv->rx_reporter,`：收发的通道重新打开以后（[drivers/net/ethernet/mellanox/mlx5/core/en_main.c 第 3007 行](../../../references/upstream/linux/drivers/net/ethernet/mellanox/mlx5/core/en_main.c#L3007) `mlx5e_health_channels_update(priv);`），把管发、管收的两个报告改成"健康"。
+  - [drivers/net/ethernet/amd/pds_core/core.c 第 616 行](../../../references/upstream/linux/drivers/net/ethernet/amd/pds_core/core.c#L616) `devlink_health_reporter_state_update(pdsc->fw_reporter,`：固件重新起来、驱动重新建好设备以后，把管固件的报告改成"健康"。
+  - [drivers/net/ethernet/intel/ice/devlink/health.c 第 537 行](../../../references/upstream/linux/drivers/net/ethernet/intel/ice/devlink/health.c#L537) `devlink_health_reporter_state_update(reporter,`：网卡复位、重建做完以后（[drivers/net/ethernet/intel/ice/ice_main.c 第 7810 行](../../../references/upstream/linux/drivers/net/ethernet/intel/ice/ice_main.c#L7810) `ice_health_clear(pf);`），把管恶意驱动检测和发送卡住的两个报告改成"健康"。
+- 这个函数自己：只许改成"健康"或者"出错"，状态没有变就返回，变了发 netlink 通知（[net/devlink/health.c 第 701 行](../../../references/upstream/linux/net/devlink/health.c#L701) `if (WARN_ON(state != DEVLINK_HEALTH_REPORTER_STATE_HEALTHY &&`、[net/devlink/health.c 第 705 行](../../../references/upstream/linux/net/devlink/health.c#L705) `if (reporter->health_state == state)`、[net/devlink/health.c 第 711 行](../../../references/upstream/linux/net/devlink/health.c#L711) `devlink_recover_notify(reporter, DEVLINK_CMD_HEALTH_REPORTER_RECOVER);`）；发通知时申请消息用的是可以睡眠的方式（[net/devlink/health.c 第 521 行](../../../references/upstream/linux/net/devlink/health.c#L521) `msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);`）。
+- Marvell 的驱动给一类硬件设四个报告，一根报错的中断线一个：[drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c 第 485 行](../../../references/upstream/linux/drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c#L485) `RVU_REPORTERS(hw_nix_intr);`、[drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c 第 486 行](../../../references/upstream/linux/drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c#L486) `RVU_REPORTERS(hw_nix_gen);`、[drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c 第 487 行](../../../references/upstream/linux/drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c#L487) `RVU_REPORTERS(hw_nix_err);`、[drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c 第 488 行](../../../references/upstream/linux/drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c#L488) `RVU_REPORTERS(hw_nix_ras);`。
+
 ## 决定-006　故障在哪里交给健康报告；同一种故障连着来时怎样算
 
 ### 已经看得到的几种做法
@@ -765,6 +780,10 @@
   - **在什么情形下报、报的是哪个报告的哪一种故障**：归的类：别的。这一处在 debugfs 文件 health/break\_health 的写函数 nsim\_dev\_health\_break\_write 里，用户进程往这个文件写字时在这个进程的上下文里直接运行，中间不隔任何东西；没有真实的故障，报的是 dummy 报告，消息是用户写进来的那段文字（去掉末尾换行）。 出处：[drivers/net/netdevsim/health.c 第 206 行](../../../references/upstream/linux/drivers/net/netdevsim/health.c#L206) `debugfs_create_file("break_health", 0200, health->ddir, health,`；[drivers/net/netdevsim/health.c 第 162 行](../../../references/upstream/linux/drivers/net/netdevsim/health.c#L162) `err = devlink_health_report(health->dummy_reporter, break_msg, &ctx);`
   - **写不写内核记录、连着来怎样处理**：归的类：每次都报。报的同时不往内核记录里写话；每写一次文件就报一次，驱动不做合并或限速。 出处：[drivers/net/netdevsim/health.c 第 162 行](../../../references/upstream/linux/drivers/net/netdevsim/health.c#L162) `err = devlink_health_report(health->dummy_reporter, break_msg, &ctx);`
 
+### 另外读到的资料
+
+- 用户给的资料（2026-11-21 转来的，没有在本地核）：上报健康报告的名单里没有归类的那一处（Broadcom bnxt 的 `bnxt_fw_dump`），搜到的是一句注释，那个位置没有调上报的函数，不是一处没有读懂的上报。
+
 ## 决定-007　报告怎样回到"健康"：恢复的回调、宽限期、自动恢复
 
 ### 已经看得到的几种做法
@@ -856,6 +875,12 @@
 
 - 用搜索取出来的数：上游各家健康报告默认的宽限期（在 `references/upstream/linux/drivers/` 里搜 `default_graceful_period`，6 处）：0，[drivers/net/ethernet/qlogic/qed/qed_devlink.c 第 90 行](../../../references/upstream/linux/drivers/net/ethernet/qlogic/qed/qed_devlink.c#L90) `#define QED_REPORTER_FW_GRACEFUL_PERIOD 0`；500 毫秒，[drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c 第 668 行](../../../references/upstream/linux/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c#L668) `#define MLX5E_REPORTER_RX_GRACEFUL_PERIOD 500`、[drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c 第 586 行](../../../references/upstream/linux/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c#L586) `#define MLX5E_REPORTER_TX_GRACEFUL_PERIOD 500`；30 秒、60 秒、180 秒，[drivers/net/ethernet/mellanox/mlx5/core/health.c 第 674 行](../../../references/upstream/linux/drivers/net/ethernet/mellanox/mlx5/core/health.c#L674) `#define MLX5_FW_REPORTER_VF_GRACEFUL_PERIOD 30000`、[drivers/net/ethernet/mellanox/mlx5/core/health.c 第 673 行](../../../references/upstream/linux/drivers/net/ethernet/mellanox/mlx5/core/health.c#L673) `#define MLX5_FW_REPORTER_PF_GRACEFUL_PERIOD 60000`、[drivers/net/ethernet/mellanox/mlx5/core/health.c 第 672 行](../../../references/upstream/linux/drivers/net/ethernet/mellanox/mlx5/core/health.c#L672) `#define MLX5_FW_REPORTER_ECPF_GRACEFUL_PERIOD 180000`。
 - 内核判断在不在宽限期里：[net/devlink/health.c 第 645 行](../../../references/upstream/linux/net/devlink/health.c#L645) `recover_ts_threshold = reporter->last_recovery_ts +`。
+- 内核判断这一次上报要不要中止的函数全文在 `net/devlink/health.c` 第 629 到 653 行：自动恢复关着，不中止（[net/devlink/health.c 第 635 行](../../../references/upstream/linux/net/devlink/health.c#L635) `if (!reporter->auto_recover)`）；报告原来的状态不是"健康"，中止（[net/devlink/health.c 第 639 行](../../../references/upstream/linux/net/devlink/health.c#L639) `if (prev_state != DEVLINK_HEALTH_REPORTER_STATE_HEALTHY)`）；在突发期里，不中止（[net/devlink/health.c 第 642 行](../../../references/upstream/linux/net/devlink/health.c#L642) `if (devlink_health_reporter_in_burst(reporter))`）；离上一次恢复不到"突发期加宽限期"，中止（[net/devlink/health.c 第 645 行](../../../references/upstream/linux/net/devlink/health.c#L645) `recover_ts_threshold = reporter->last_recovery_ts +`、[net/devlink/health.c 第 646 行](../../../references/upstream/linux/net/devlink/health.c#L646) `msecs_to_jiffies(reporter->burst_period) +`、[net/devlink/health.c 第 647 行](../../../references/upstream/linux/net/devlink/health.c#L647) `msecs_to_jiffies(reporter->graceful_period);`、[net/devlink/health.c 第 648 行](../../../references/upstream/linux/net/devlink/health.c#L648) `if (reporter->last_recovery_ts && reporter->recovery_count &&`、[net/devlink/health.c 第 649 行](../../../references/upstream/linux/net/devlink/health.c#L649) `time_is_after_jiffies(recover_ts_threshold))`）。
+- 上报的函数里：记下原来的状态（[net/devlink/health.c 第 666 行](../../../references/upstream/linux/net/devlink/health.c#L666) `prev_health_state = reporter->health_state;`）；中止的那一次直接返回，不存现场、不恢复（[net/devlink/health.c 第 670 行](../../../references/upstream/linux/net/devlink/health.c#L670) `if (devlink_health_recover_abort(reporter, prev_health_state)) {`、[net/devlink/health.c 第 676 行](../../../references/upstream/linux/net/devlink/health.c#L676) `return -ECANCELED;`）。
+- 恢复的函数：状态已经是"健康"就返回（[net/devlink/health.c 第 566 行](../../../references/upstream/linux/net/devlink/health.c#L566) `return 0;`）；没有恢复的回调回"不支持"（[net/devlink/health.c 第 569 行](../../../references/upstream/linux/net/devlink/health.c#L569) `return -EOPNOTSUPP;`）；回调失败就把错误交回、状态不变（[net/devlink/health.c 第 573 行](../../../references/upstream/linux/net/devlink/health.c#L573) `return err;`）；成功以后记下恢复、改成"健康"（[net/devlink/health.c 第 575 行](../../../references/upstream/linux/net/devlink/health.c#L575) `devlink_health_reporter_recovery_done(reporter);`、[net/devlink/health.c 第 576 行](../../../references/upstream/linux/net/devlink/health.c#L576) `reporter->health_state = DEVLINK_HEALTH_REPORTER_STATE_HEALTHY;`）。用户的恢复命令调的是同一个函数（[net/devlink/health.c 第 725 行](../../../references/upstream/linux/net/devlink/health.c#L725) `return devlink_health_reporter_recover(reporter, NULL, info->extack);`）。
+- 突发期：判断在不在突发期里（[net/devlink/health.c 第 540 行](../../../references/upstream/linux/net/devlink/health.c#L540) `unsigned long burst_threshold = reporter->last_recovery_ts +`、[net/devlink/health.c 第 543 行](../../../references/upstream/linux/net/devlink/health.c#L543) `return time_is_after_jiffies(burst_threshold);`）；恢复做完时，不在突发期里才更新"上一次恢复的时刻"（[net/devlink/health.c 第 550 行](../../../references/upstream/linux/net/devlink/health.c#L550) `if (!devlink_health_reporter_in_burst(reporter))`、[net/devlink/health.c 第 555 行](../../../references/upstream/linux/net/devlink/health.c#L555) `reporter->last_recovery_ts = jiffies;`）；默认值出自驱动的回调表（[net/devlink/health.c 第 130 行](../../../references/upstream/linux/net/devlink/health.c#L130) `reporter->burst_period = ops->default_burst_period;`），给了突发期而不给宽限期内核会警告（[net/devlink/health.c 第 119 行](../../../references/upstream/linux/net/devlink/health.c#L119) `if (WARN_ON(ops->default_burst_period && !ops->default_graceful_period))`）。
+- 内核限速的内核记录的默认值：[include/linux/ratelimit_types.h 第 9 行](../../../references/upstream/linux/include/linux/ratelimit_types.h#L9) `#define DEFAULT_RATELIMIT_INTERVAL	(5 * HZ)`、[include/linux/ratelimit_types.h 第 10 行](../../../references/upstream/linux/include/linux/ratelimit_types.h#L10) `#define DEFAULT_RATELIMIT_BURST		10`。
+- 用户给的资料（2026-11-21 转来的），本地核过：内核的普通工作队列没有最晚执行时间的保证，延迟的时间只决定多久以后入队（[编译用的内核 6.18.44 的 kernel/workqueue.c 第 2513 行](../../../worktrees/openwrt-nss-adaptation-workrepo/build_dir/target-aarch64_cortex-a53_musl/linux-qualcommax_ipq807x/linux-6.18.44/kernel/workqueue.c#L2513) `void delayed_work_timer_fn(struct timer_list *t)`）。
 
 ## 决定-008　诊断、存现场、测试三个回调各给用户什么
 
@@ -914,6 +939,7 @@
 ### 另外读到的资料
 
 - 在 `references/upstream/linux/drivers/` 里搜行首是 `.test =` 的行，属于健康报告回调表的只有 1 处：[drivers/net/ethernet/mellanox/mlxsw/core.c 第 2019 行](../../../references/upstream/linux/drivers/net/ethernet/mellanox/mlxsw/core.c#L2019) `.test = mlxsw_core_health_fw_fatal_test,`；它的函数体是发一条命令叫固件报一次致命错：[drivers/net/ethernet/mellanox/mlxsw/core.c 第 2011 行](../../../references/upstream/linux/drivers/net/ethernet/mellanox/mlxsw/core.c#L2011) `mlxsw_reg_mfgd_trigger_test_set(mfgd_pl, true);`。
+- 用户给的资料（2026-11-21 转来的，没有在本地核）：已经查过的 HPPE、EDMA 的定义里没有找到针对九种 EDMA 错的注入字段；不能扩大成整颗芯片一定没有这种能力。
 
 ## 决定-009　devlink 设备的回调表（`struct devlink_ops`）和端口的回调表（`struct devlink_port_ops`）各登记哪几个回调
 
@@ -1192,6 +1218,11 @@ devlink 设备的回调表的定义的名单：
   - **用在哪一种口上**：归的类：PCI 功能一类的口。sfc\_devlink\_port\_ops 只在 efx\_devlink\_add\_port 里传给 devl\_port\_register\_with\_ops（只在打开 CONFIG\_SFC\_SRIOV 时编进去），对象是 ef100\_set\_devlink\_port 用 efx\_mae\_get\_mport 取到的 MAE mport 描述：只给 VNIC 类型的 mport 登记，带虚拟功能号的设成 PCI\_VF，不带的设成 PCI\_PF，别的类型不登记。调用的地方有两处：ef100 物理功能自己的网卡建好时（ef100\_pf\_set\_devlink\_port），以及给虚拟功能建代表口时（ef100\_rep\_set\_devlink\_port）。 出处：[drivers/net/ethernet/sfc/efx_devlink.c 第 151 行](../../../references/upstream/linux/drivers/net/ethernet/sfc/efx_devlink.c#L151) `devlink_port_attrs_pci_vf_set(&mport->dl_port, 0, mport->pf_idx,`；[drivers/net/ethernet/sfc/efx_devlink.c 第 155 行](../../../references/upstream/linux/drivers/net/ethernet/sfc/efx_devlink.c#L155) `devlink_port_attrs_pci_pf_set(&mport->dl_port, 0, mport->pf_idx,`
   - **每个回调做什么**：表里只有 port\_fn\_hw\_addr\_get 和 port\_fn\_hw\_addr\_set，管的是这个 PCI 功能的 MAC 地址，都经 MCDI 命令：get 只许本机接口上的口，按物理功能号或虚拟功能号用 MC\_CMD\_GET\_CLIENT\_HANDLE 找到这个功能在固件里的客户号，再用 MC\_CMD\_GET\_CLIENT\_MAC\_ADDRESSES 读地址；set 只许虚拟功能的口（物理功能的口报不许），找到客户号后用 MC\_CMD\_SET\_CLIENT\_MAC\_ADDRESSES 写地址。 出处：[drivers/net/ethernet/sfc/efx_devlink.c 第 92 行](../../../references/upstream/linux/drivers/net/ethernet/sfc/efx_devlink.c#L92) `if (!ef100_mport_is_vf(mport_desc)) {`；[drivers/net/ethernet/sfc/efx_devlink.c 第 118 行](../../../references/upstream/linux/drivers/net/ethernet/sfc/efx_devlink.c#L118) `rc = efx_mcdi_rpc(devlink->efx, MC_CMD_SET_CLIENT_MAC_ADDRESSES, inbuf,`
 
+### 另外读到的资料
+
+- 内核文档里重新加载的用处：[Documentation/networking/devlink/devlink-reload.rst 第 8 行](../../../references/upstream/linux/Documentation/networking/devlink/devlink-reload.rst#L8) ``` ``devlink-params`` and ``devlink-resources`` new values. It also provides ```、[Documentation/networking/devlink/devlink-reload.rst 第 27 行](../../../references/upstream/linux/Documentation/networking/devlink/devlink-reload.rst#L27) ``` * ``devlink-params`` in configuration mode ``driverinit`` ```、[Documentation/networking/devlink/devlink-reload.rst 第 36 行](../../../references/upstream/linux/Documentation/networking/devlink/devlink-reload.rst#L36) ``` * - ``fw_activate`` ```、[Documentation/networking/devlink/devlink-reload.rst 第 69 行](../../../references/upstream/linux/Documentation/networking/devlink/devlink-reload.rst#L69) `The netns option allows user to be able to move devlink instances into`。
+- 用户给的资料（2026-11-21 转来的，没有在本地核）：`netdevsim` 的刷写回调模拟的是刷写的进度，不把固件的数据写进设备；它没有归进"刷设备自己的固件"是有实际原因的。
+
 ## 决定-010　镜像里默认带不带 `devlink` 这个命令
 
 ### 已经看得到的几种做法
@@ -1230,6 +1261,10 @@ devlink 设备的回调表的定义的名单：
 ### 名单
 
 这一件没有别家驱动的名单。
+
+### 另外读到的资料
+
+- 用户给的资料（2026-11-21 转来的，没有在本地核）：和本地版本一样、架构是 `aarch64_cortex-a53` 的 OpenWrt 官方 6.18.0-r2 的 `devlink` 包：下载包 51848 字节；装上以后文件合计 119253 字节，其中命令的程序 119235 字节。它依赖的 `libmnl0`：下载包 8327 字节，装上以后 20528 字节。依赖是 `libmnl0` 和系统的 C 库。压进镜像以后多多少，不能直接拿装上以后的大小当。官方的软件包目录：<https://downloads.openwrt.org/releases/25.12-SNAPSHOT/packages/aarch64_cortex-a53/base/>。
 
 ## 抽查的记录
 
