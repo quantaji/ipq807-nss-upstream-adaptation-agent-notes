@@ -1,0 +1,434 @@
+diff -u -r a/ipq807x/edma.c b/ipq807x/edma.c
+--- a/ipq807x/edma.c	2026-11-20 10:46:08.128221779 -0700
++++ b/ipq807x/edma.c	2026-11-20 10:46:08.148140851 -0700
+@@ -18,6 +18,8 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/if_vlan.h>
+ #include <linux/interrupt.h>
++#include <linux/log2.h>
++#include <linux/module.h>
+ #include <linux/netdevice.h>
+ #include <linux/of.h>
+ #include <linux/of_irq.h>
+@@ -27,6 +29,99 @@
+ #include "ppe.h"
+ #include "edma_regs.h"
+ 
++/* E-0005 experiment only. Parameters given when the module is loaded:
++ *
++ * exp_fc_group: 0 leaves every TX ring in flow control group 0; 1 puts the TX
++ * rings of a port into the group with the port's number.
++ * exp_tx_ring_xg: how many slots a TX ring of a 10G port has.
++ * exp_txcmpl_ring: how many slots a TX completion ring has.
++ * exp_rx_thread, exp_tx_thread: whether the RX polls and the TX completion
++ * polls run as threads (1) or as softirqs (0).
++ *
++ * exp_prehdr_src can be written while the driver runs: 1 makes the pre-header
++ * of every packet say it comes from the port it goes out of.
++ *
++ * Reading exp_rings gives the error status word and mask and, for each of the
++ * host's TX rings and TX completion rings, where the hardware and the driver
++ * stand in it and the ring's control word.
++ */
++unsigned int exp_fc_group;
++module_param(exp_fc_group, uint, 0444);
++unsigned int exp_tx_ring_xg = EDMA_TX_RING_SIZE;
++module_param(exp_tx_ring_xg, uint, 0444);
++unsigned int exp_txcmpl_ring = EDMA_TX_RING_SIZE;
++module_param(exp_txcmpl_ring, uint, 0444);
++static unsigned int exp_rx_thread = 1;
++module_param(exp_rx_thread, uint, 0444);
++static unsigned int exp_tx_thread = 1;
++module_param(exp_tx_thread, uint, 0444);
++unsigned int exp_prehdr_src;
++module_param(exp_prehdr_src, uint, 0644);
++
++static struct ppe_device *exp_ppe_dev;
++
++static int exp_rings_get(char *buf, const struct kernel_param *kp)
++{
++	const struct ppe_soc_data *soc;
++	struct edma_ring *ring;
++	struct regmap *regmap;
++	u32 prod, cons, ctrl;
++	int i, held, slot;
++	int len = 0;
++
++	if (!exp_ppe_dev)
++		return -ENODEV;
++
++	soc = exp_ppe_dev->soc;
++	regmap = exp_ppe_dev->regmap;
++
++	regmap_read(regmap, EDMA_BASE_OFFSET + EDMA_REG_MISC_INT_STAT, &prod);
++	regmap_read(regmap, EDMA_BASE_OFFSET + EDMA_REG_MISC_INT_MASK, &cons);
++	len += sysfs_emit_at(buf, len, "misc stat %#x mask %#x unknown %u\n",
++			     prod, cons, exp_ppe_dev->edma.misc_unknown);
++
++	for (i = 0; i < ARRAY_SIZE(exp_ppe_dev->edma.txdesc); i++) {
++		ring = &exp_ppe_dev->edma.txdesc[i];
++		if (!ring->desc)
++			continue;
++
++		regmap_read(regmap, EDMA_BASE_OFFSET +
++			    EDMA_REG_TXDESC_PROD_IDX(ring->id), &prod);
++		regmap_read(regmap, EDMA_BASE_OFFSET +
++			    EDMA_REG_TXDESC_CONS_IDX(ring->id), &cons);
++		regmap_read(regmap, EDMA_BASE_OFFSET +
++			    EDMA_REG_TXDESC_CTRL(ring->id), &ctrl);
++		held = 0;
++		for (slot = 0; slot < ring->count; slot++)
++			if (ring->skb_store[slot])
++				held++;
++		len += sysfs_emit_at(buf, len,
++				     "tx %u port %u q%d size %u prod %u cons %u ctrl %#x held %d\n",
++				     ring->id, ring->port, ring->queue,
++				     ring->count, prod, cons, ctrl, held);
++	}
++
++	for (i = 0; i < exp_ppe_dev->edma.num_txcmpl; i++) {
++		ring = &exp_ppe_dev->edma.txcmpl[i];
++		regmap_read(regmap, EDMA_BASE_OFFSET +
++			    EDMA_REG_TXCMPL_PROD_IDX(soc->edma_txcmpl_base,
++						     ring->id), &prod);
++		regmap_read(regmap, EDMA_BASE_OFFSET +
++			    EDMA_REG_TXCMPL_CONS_IDX(soc->edma_txcmpl_base,
++						     ring->id), &cons);
++		len += sysfs_emit_at(buf, len,
++				     "txcmpl %u size %u prod %u cons %u\n",
++				     ring->id, ring->count, prod, cons);
++	}
++
++	return len;
++}
++
++static const struct kernel_param_ops exp_rings_ops = {
++	.get = exp_rings_get,
++};
++module_param_cb(exp_rings, &exp_rings_ops, NULL, 0444);
++
+ /* Bring the whole EDMA to a known state: reset it, mask every ring
+  * interrupt, switch every ring and the block itself off, and write the two
+  * settings that are not a ring's. This is the one place that touches rings
+@@ -141,10 +236,18 @@
+ 
+ 	for (i = 0; i < ARRAY_SIZE(edma->txdesc); i++) {
+ 		ring = &edma->txdesc[i];
+-		if (ring->desc)
+-			regmap_set_bits(regmap, EDMA_BASE_OFFSET +
+-					EDMA_REG_TXDESC_CTRL(ring->id),
+-					EDMA_TXDESC_TX_EN);
++		if (!ring->desc)
++			continue;
++
++		/* E-0005 experiment only: the ring's flow control group */
++		regmap_update_bits(regmap, EDMA_BASE_OFFSET +
++				   EDMA_REG_TXDESC_CTRL(ring->id),
++				   EDMA_TXDESC_FC_GRP_MASK,
++				   (exp_fc_group ? ring->port : 0) <<
++				   EDMA_TXDESC_FC_GRP_SHIFT);
++		regmap_set_bits(regmap, EDMA_BASE_OFFSET +
++				EDMA_REG_TXDESC_CTRL(ring->id),
++				EDMA_TXDESC_TX_EN);
+ 	}
+ }
+ 
+@@ -270,7 +373,7 @@
+ 	{ EDMA_MISC_TX_SRAM_FULL, "TX SRAM full" },
+ 	{ EDMA_MISC_TX_CMPL_BUF_FULL, "TX completion buffer full" },
+ 	{ EDMA_MISC_PKT_LEN_LA_64K, "packet longer than 64K" },
+-	{ EDMA_MISC_PKT_LEN_LE_40, "packet of 40 bytes or less" },
++	{ EDMA_MISC_PKT_LEN_LE_40, "packet too short" },
+ 	{ EDMA_MISC_DATA_LEN_ERR, "data length error" },
+ };
+ 
+@@ -283,14 +386,22 @@
+ static irqreturn_t edma_misc_irq(int irq, void *ctx)
+ {
+ 	struct ppe_device *ppe_dev = ctx;
+-	u32 stat;
++	u32 raw, stat;
+ 	int i;
+ 
+ 	regmap_read(ppe_dev->regmap, EDMA_BASE_OFFSET + EDMA_REG_MISC_INT_STAT,
+-		    &stat);
+-	stat &= ppe_dev->soc->edma_misc_int_mask;
+-	if (!stat)
++		    &raw);
++	stat = raw & ppe_dev->soc->edma_misc_int_mask;
++	if (!stat) {
++		/* Nothing the driver knows of. What was read is logged the
++		 * first few times, so that it can be seen what came.
++		 */
++		if (ppe_dev->edma.misc_unknown++ < 32)
++			dev_err(ppe_dev->dev,
++				"EDMA: error interrupt, status %#x holds no known error\n",
++				raw);
+ 		return IRQ_NONE;
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(edma_misc_errors); i++)
+ 		if (stat & edma_misc_errors[i].bit)
+@@ -468,7 +579,8 @@
+ 		return -ENOMEM;
+ 	strscpy(edma->rx_napi_dev->name, "edma_rx",
+ 		sizeof(edma->rx_napi_dev->name));
+-	netif_threaded_enable(edma->rx_napi_dev);
++	if (exp_rx_thread)
++		netif_threaded_enable(edma->rx_napi_dev);
+ 
+ 	edma->tx_napi_dev = alloc_netdev_dummy(0);
+ 	if (!edma->tx_napi_dev) {
+@@ -477,7 +589,8 @@
+ 	}
+ 	strscpy(edma->tx_napi_dev->name, "edma_tx",
+ 		sizeof(edma->tx_napi_dev->name));
+-	netif_threaded_enable(edma->tx_napi_dev);
++	if (exp_tx_thread)
++		netif_threaded_enable(edma->tx_napi_dev);
+ 
+ 	for (i = 0; i < edma->num_rx; i++)
+ 		netif_napi_add(edma->rx_napi_dev, &edma->rxdesc[i].napi,
+@@ -624,6 +737,7 @@
+ 		edma_rx_irq_set(&edma->rxdesc[i], true);
+ 
+ 	of_node_put(np);
++	exp_ppe_dev = ppe_dev;
+ 
+ 	return 0;
+ 
+@@ -657,6 +771,8 @@
+ 	struct edma *edma = &ppe_dev->edma;
+ 	int i;
+ 
++	exp_ppe_dev = NULL;
++
+ 	for (i = 0; i < edma->num_txcmpl; i++)
+ 		edma_tx_irq_set(&edma->txcmpl[i], false);
+ 	for (i = 0; i < edma->num_rx; i++)
+diff -u -r a/ipq807x/edma_regs.h b/ipq807x/edma_regs.h
+--- a/ipq807x/edma_regs.h	2026-11-20 10:46:08.128192877 -0700
++++ b/ipq807x/edma_regs.h	2026-11-20 10:46:08.147656009 -0700
+@@ -65,6 +65,9 @@
+ #define EDMA_TXDESC_CONS_IDX_MASK 0xffff
+ #define EDMA_TXDESC_RING_SIZE_MASK 0xffff
+ #define EDMA_TXDESC_TX_EN 0x1
++/* Which of the eight flow control groups a TX ring is in */
++#define EDMA_TXDESC_FC_GRP_SHIFT 1
++#define EDMA_TXDESC_FC_GRP_MASK 0xe
+ 
+ /* TX completion ring registers */
+ #define EDMA_REG_TXCMPL_BA(b, n)        ((b) + (0x1000 * (n)))
+diff -u -r a/ipq807x/edma_tx.c b/ipq807x/edma_tx.c
+--- a/ipq807x/edma_tx.c	2026-11-20 10:46:08.124311350 -0700
++++ b/ipq807x/edma_tx.c	2026-11-20 10:46:08.148228588 -0700
+@@ -12,6 +12,7 @@
+ 
+ #include <linux/etherdevice.h>
+ #include <linux/interrupt.h>
++#include <linux/log2.h>
+ #include <linux/netdevice.h>
+ #include <linux/skbuff.h>
+ 
+@@ -85,7 +86,10 @@
+ 		ring = &edma->txcmpl[q];
+ 		ring->id = soc->edma_num_txcmpl_rings - edma->num_txcmpl + q;
+ 
+-		ret = edma_ring_alloc(ppe_dev, ring, EDMA_TX_RING_SIZE);
++		/* E-0005 experiment only: the length is a parameter */
++		ret = edma_ring_alloc(ppe_dev, ring,
++				      is_power_of_2(exp_txcmpl_ring) ?
++				      exp_txcmpl_ring : EDMA_TX_RING_SIZE);
+ 		if (ret)
+ 			goto err;
+ 	}
+@@ -99,13 +103,19 @@
+ 			ring = edma_tx_ring_get(ppe_dev, i, q);
+ 			ring->id = port->tx_ring_base + q;
+ 			ring->queue = q;
++			ring->port = i;
+ 
++			/* E-0005 experiment only: the length of a 10G port's
++			 * TX rings is a parameter
++			 */
+ 			ret = edma_ring_alloc(ppe_dev, ring,
+-					      EDMA_TX_RING_SIZE);
++					      i >= soc->first_xgmac_port &&
++					      is_power_of_2(exp_tx_ring_xg) ?
++					      exp_tx_ring_xg : EDMA_TX_RING_SIZE);
+ 			if (ret)
+ 				goto err;
+ 
+-			ring->skb_store = kcalloc(EDMA_TX_RING_SIZE,
++			ring->skb_store = kcalloc(ring->count,
+ 						  sizeof(struct sk_buff *),
+ 						  GFP_KERNEL);
+ 			if (!ring->skb_store) {
+@@ -350,6 +360,10 @@
+ 	txph->dst_info = cpu_to_le16((EDMA_PREHDR_TYPE_PORT << 8) |
+ 				     (port->port_id &
+ 				      EDMA_PREHDR_DST_PORT_MASK));
++	/* E-0005 experiment only */
++	if (exp_prehdr_src)
++		txph->src_info = cpu_to_le16((EDMA_PREHDR_TYPE_PORT << 8) |
++					     port->port_id);
+ 
+ 	dma = dma_map_single(ppe_dev->dev, skb->data, skb->len,
+ 			     DMA_TO_DEVICE);
+diff -u -r a/ipq807x/ppe_config.c b/ipq807x/ppe_config.c
+--- a/ipq807x/ppe_config.c	2026-11-20 10:46:08.128300872 -0700
++++ b/ipq807x/ppe_config.c	2026-11-20 10:46:08.148318247 -0700
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/delay.h>
+ #include <linux/if_vlan.h>
++#include <linux/module.h>
+ #include <linux/random.h>
+ 
+ #include "ppe.h"
+@@ -968,11 +969,116 @@
+ 		dev_warn(ppe_dev->dev, "flushing the address table timed out\n");
+ }
+ 
++/* E-0005 experiment only: two parameters that rewrite, while the driver runs,
++ * the buffer limits the PPE applies to what the host sends.
++ *
++ * exp_cpu_bm takes "fc ceiling react weight": for each of the eight buffer
++ * manager ports on the CPU side, whether a full port holds the host back (1)
++ * or not (0), and the port's three limits. The driver loads with
++ * "0 250 100 4".
++ *
++ * exp_uni_ac takes "ceiling weight force": for every unicast queue, the two
++ * limits of how many buffers the queue may hold before frames for it are
++ * dropped, and whether frames of a source under flow control are dropped by
++ * these limits as well (1) or not (0). The driver loads with "400 4 0".
++ *
++ * Reading either gives what was last written to it.
++ */
++static struct ppe_device *exp_ppe_dev;
++static char exp_cpu_bm_now[32] = "0 250 100 4";
++static char exp_uni_ac_now[32] = "400 4 0";
++
++static int exp_cpu_bm_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int fc, ceiling, react, weight;
++	int i;
++
++	if (!exp_ppe_dev)
++		return -ENODEV;
++	if (sscanf(val, "%u %u %u %u", &fc, &ceiling, &react, &weight) != 4)
++		return -EINVAL;
++
++	for (i = 0; i < PPE_BM_PHY_START; i++) {
++		regmap_write(exp_ppe_dev->regmap, PPE_BM_FC_MODE(i),
++			     fc ? PPE_BM_FC_EN : 0);
++		regmap_write(exp_ppe_dev->regmap, PPE_BM_PORT_FC_W0(i),
++			     FIELD_PREP(PPE_BM_REACT_LIMIT, react) |
++			     FIELD_PREP(PPE_BM_RESUME_OFF, 36) |
++			     FIELD_PREP(PPE_BM_CEILING_LO, ceiling & 0x7));
++		regmap_write(exp_ppe_dev->regmap, PPE_BM_PORT_FC_W1(i),
++			     FIELD_PREP(PPE_BM_CEILING_HI, ceiling >> 3) |
++			     FIELD_PREP(PPE_BM_WEIGHT, weight) |
++			     PPE_BM_DYNAMIC);
++	}
++
++	snprintf(exp_cpu_bm_now, sizeof(exp_cpu_bm_now), "%u %u %u %u", fc,
++		 ceiling, react, weight);
++
++	return 0;
++}
++
++static int exp_cpu_bm_get(char *buf, const struct kernel_param *kp)
++{
++	return sysfs_emit(buf, "%s\n", exp_cpu_bm_now);
++}
++
++static const struct kernel_param_ops exp_cpu_bm_ops = {
++	.set = exp_cpu_bm_set,
++	.get = exp_cpu_bm_get,
++};
++module_param_cb(exp_cpu_bm, &exp_cpu_bm_ops, NULL, 0644);
++
++static int exp_uni_ac_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int ceiling, weight, force;
++	int i;
++
++	if (!exp_ppe_dev)
++		return -ENODEV;
++	if (sscanf(val, "%u %u %u", &ceiling, &weight, &force) != 3)
++		return -EINVAL;
++
++	/* An entry has four words and the hardware takes it only when the
++	 * last one is written: all four go out, as at boot. Bit 2 of the
++	 * first word is the one that has the limits applied to frames of a
++	 * source under flow control.
++	 */
++	for (i = 0; i < PPE_L0_UCAST_QUEUES; i++) {
++		regmap_write(exp_ppe_dev->regmap, PPE_QM_AC_UNI_W0(i),
++			     PPE_AC_EN | (force ? BIT(2) : 0) |
++			     PPE_AC_SHARED_DYNAMIC |
++			     FIELD_PREP(PPE_AC_SHARED_WEIGHT, weight) |
++			     FIELD_PREP(PPE_AC_SHARED_CEILING, ceiling));
++		regmap_write(exp_ppe_dev->regmap, PPE_QM_AC_UNI_W1(i), 0);
++		regmap_write(exp_ppe_dev->regmap, PPE_QM_AC_UNI_W2(i), 0);
++		regmap_write(exp_ppe_dev->regmap, PPE_QM_AC_UNI_W3(i),
++			     FIELD_PREP(PPE_AC_GRN_RESUME_OFF, 36));
++	}
++
++	snprintf(exp_uni_ac_now, sizeof(exp_uni_ac_now), "%u %u %u", ceiling,
++		 weight, force);
++
++	return 0;
++}
++
++static int exp_uni_ac_get(char *buf, const struct kernel_param *kp)
++{
++	return sysfs_emit(buf, "%s\n", exp_uni_ac_now);
++}
++
++static const struct kernel_param_ops exp_uni_ac_ops = {
++	.set = exp_uni_ac_set,
++	.get = exp_uni_ac_get,
++};
++module_param_cb(exp_uni_ac, &exp_uni_ac_ops, NULL, 0644);
++
+ /* Boot-time PPE configuration. The order is the order qca_ppe used. */
+ void ppe_hw_config(struct ppe_device *ppe_dev)
+ {
+ 	int i;
+ 
++	exp_ppe_dev = ppe_dev;
++
+ 	mutex_lock(&ppe_dev->config_lock);
+ 
+ 	ppe_config_tdm(ppe_dev);
+diff -u -r a/ipq807x/ppe.h b/ipq807x/ppe.h
+--- a/ipq807x/ppe.h	2026-11-20 10:46:08.124339165 -0700
++++ b/ipq807x/ppe.h	2026-11-20 10:46:08.147738535 -0700
+@@ -184,6 +184,8 @@
+ 	 */
+ 	struct sk_buff **skb_store;
+ 	u8 queue;
++	/* TX ring: the port it belongs to */
++	u8 port;
+ 	/* TX ring: how far the driver has filled it, and how far the hardware
+ 	 * had sent when the driver last asked. Both are the xmit side's.
+ 	 */
+@@ -221,8 +223,16 @@
+ 	struct net_device *tx_napi_dev;
+ 
+ 	int misc_irq;
++	/* How many error interrupts came with none of the known errors set */
++	u32 misc_unknown;
+ };
+ 
++/* E-0005 experiment only: see edma.c */
++extern unsigned int exp_fc_group;
++extern unsigned int exp_tx_ring_xg;
++extern unsigned int exp_txcmpl_ring;
++extern unsigned int exp_prehdr_src;
++
+ struct ppe_device {
+ 	struct device *dev;
+ 	struct regmap *regmap;
