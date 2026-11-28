@@ -55,7 +55,7 @@
 
 **二、碰的每一块硬件**
 
-- PPE 的口：[新驱动的 ppe.c 第 160 行](../../../worktrees/openwrt-nss-adaptation-workrepo/target/linux/qualcommax/files/drivers/net/ethernet/qualcomm/ipq807x/ppe.c#L160) `.num_ports		= 8,`；新驱动给口登记网口的地方 [新驱动的 ppe_netdev.c 第 366 行](../../../worktrees/openwrt-nss-adaptation-workrepo/target/linux/qualcommax/files/drivers/net/ethernet/qualcomm/ipq807x/ppe_netdev.c#L366) `ret = register_netdev(port->netdev);`。有网口的口填什么，归决定-001、决定-004；没有网口的口登记不登记，归决定-003；拿硬件的什么当"属于哪台交换机"的编号，归决定-002。
+- PPE 的口：[新驱动的 ppe.c 第 191 行](../../../worktrees/openwrt-nss-adaptation-workrepo/target/linux/qualcommax/files/drivers/net/ethernet/qualcomm/ipq807x/ppe.c#L191) `.num_ports		= 8,`；新驱动给口登记网口的地方 [新驱动的 ppe_netdev.c 第 401 行](../../../worktrees/openwrt-nss-adaptation-workrepo/target/linux/qualcommax/files/drivers/net/ethernet/qualcomm/ipq807x/ppe_netdev.c#L401) `ret = register_netdev(port->netdev);`。有网口的口填什么，归决定-001、决定-004；没有网口的口登记不登记，归决定-003；拿硬件的什么当"属于哪台交换机"的编号，归决定-002。
 - 健康报告要报的故障，出自第四步的设计文件第九节管的几处硬件：报错的中断（那一节的决定-003、决定-004），环上的账对不上（那一节的决定-009）。这里要定的是：设几个报告、各管什么（决定-005）；在哪里报、连着来怎样算（决定-006）；怎样回到"健康"（决定-007）；诊断、存现场时读哪些寄存器给用户（决定-008）。
 
 **三、每一个时刻**
@@ -678,7 +678,7 @@
 上报健康报告的地方的名单：
 
 - 上报健康报告的地方（一处算一家，一共 26 处）：
-  - **在什么情形下报、报的是哪个报告的哪一种故障**："排出去的工作里报" 16；"定时器或者定时的工作里报" 2；"固件事件的回调里报" 4；"别的" 3；规定的词对不上或者源码里读不出、没有归类的 1。
+  - **在什么情形下报、报的是哪个报告的哪一种故障**："排出去的工作里报" 16；"定时器或者定时的工作里报" 2；"固件事件的回调里报" 4；"别的" 3；搜到的是一句注释、不是上报的地方的 1。
   - **写不写内核记录、连着来怎样处理**："每次都报" 10；"关掉来源，恢复以后再开" 8；"合并或者限速" 7。
 
 ### 用搜索取出来的数的表
@@ -1009,7 +1009,7 @@ devlink 设备的回调表的定义的名单：
   - **丢包原因（trap）那一组回调**："有队列或者缓冲这一类" 3；"没有这一类" 2。
   - **共用缓冲（sb）那一组回调**："通 CPU 的口算在里面" 3；"不算" 1。
   - **`eswitch_` 那一组回调**："管虚拟功能（VF、SF）和物理口之间怎样转发" 7；"管别的东西" 1。
-  - **刷写的回调**："刷写设备自己的固件" 15；规定的词对不上或者源码里读不出、没有归类的 1。
+  - **刷写的回调**："刷写设备自己的固件" 15；规定的词对不上、答里写了实情的 1（模拟刷写的进度，不往设备里写）。
   - **限速那一组回调**（一个驱动可以归进几类）："给虚拟功能一类的口限速" 3；"别的" 3。
   - **新建端口的回调**："PCI 功能一类的口" 2。
 

@@ -1,0 +1,2851 @@
+diff -u -r -N a/ipq807x/edma.c b/ipq807x/edma.c
+--- a/ipq807x/edma.c	2026-11-27 08:58:58.494236491 -0700
++++ b/ipq807x/edma.c	2026-11-27 13:52:59.527318748 -0700
+@@ -192,8 +192,9 @@
+ 				   EDMA_REG_TXDESC2CMPL_MAP(ring->id /
+ 							    EDMA_RING_MAP_PER_REG),
+ 				   EDMA_RING_MAP_MASK << shift,
+-				   edma->txcmpl[ppe_dev->ports[ring->port]->tx_cmpl_base +
+-						ring->queue].id << shift);
++				   edma->txcmpl[(ppe_dev->ports[ring->port]->tx_cmpl_base +
++						 ring->queue) %
++						edma->num_txcmpl].id << shift);
+ 	}
+ }
+ 
+@@ -616,7 +617,8 @@
+ 
+ 	edma->rx_buffer_size = (PAGE_SIZE << pp.order) - NET_SKB_PAD -
+ 			       SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+-	pp.max_len = edma->rx_buffer_size;
++	pp.max_len = exp_sync_len ? min(exp_sync_len, edma->rx_buffer_size) :
++				    edma->rx_buffer_size;
+ 
+ 	fill->page_pool = page_pool_create(&pp);
+ 	if (IS_ERR(fill->page_pool)) {
+@@ -645,7 +647,8 @@
+ 		return -ENOMEM;
+ 	strscpy(edma->rx_napi_dev->name, "edma_rx",
+ 		sizeof(edma->rx_napi_dev->name));
+-	netif_threaded_enable(edma->rx_napi_dev);
++	if (!exp_rx_softirq)
++		netif_threaded_enable(edma->rx_napi_dev);
+ 
+ 	edma->tx_napi_dev = alloc_netdev_dummy(0);
+ 	if (!edma->tx_napi_dev) {
+@@ -654,14 +657,24 @@
+ 	}
+ 	strscpy(edma->tx_napi_dev->name, "edma_tx",
+ 		sizeof(edma->tx_napi_dev->name));
++	if (exp_tx_thread)
++		netif_threaded_enable(edma->tx_napi_dev);
+ 
+-	for (i = 0; i < edma->num_rx; i++)
+-		netif_napi_add(edma->rx_napi_dev, &edma->rxdesc[i].napi,
+-			       edma_rx_poll);
++	/* E-0007 experiment only: exp_defer_irqs, exp_gro_flush_us */
++	edma->rx_napi_dev->napi_defer_hard_irqs = exp_defer_irqs;
++	edma->rx_napi_dev->gro_flush_timeout = exp_gro_flush_us * NSEC_PER_USEC;
++	edma->tx_napi_dev->napi_defer_hard_irqs = exp_defer_irqs;
++	edma->tx_napi_dev->gro_flush_timeout = exp_gro_flush_us * NSEC_PER_USEC;
+ 
+-	for (i = 0; i < edma->num_txcmpl; i++)
+-		netif_napi_add(edma->tx_napi_dev, &edma->txcmpl[i].napi,
+-			       edma_tx_poll);
++	for (i = 0; i < edma->num_rx; i++)
++		netif_napi_add_weight(edma->rx_napi_dev, &edma->rxdesc[i].napi,
++				      edma_rx_poll,
++				      exp_rx_weight ?: NAPI_POLL_WEIGHT);
++
++	for (i = 0; !exp_combined && i < edma->num_txcmpl; i++)
++		netif_napi_add_weight(edma->tx_napi_dev, &edma->txcmpl[i].napi,
++				      edma_tx_poll,
++				      exp_tx_weight ?: NAPI_POLL_WEIGHT);
+ 
+ 	return 0;
+ }
+@@ -671,7 +684,7 @@
+ 	struct edma *edma = &ppe_dev->edma;
+ 	int i;
+ 
+-	for (i = 0; i < edma->num_txcmpl; i++)
++	for (i = 0; !exp_combined && i < edma->num_txcmpl; i++)
+ 		netif_napi_del(&edma->txcmpl[i].napi);
+ 	for (i = 0; i < edma->num_rx; i++)
+ 		netif_napi_del(&edma->rxdesc[i].napi);
+@@ -763,6 +776,12 @@
+ 	if (ret)
+ 		goto err_page_pool;
+ 
++	/* One poll for an RX ring and a completion ring needs as many of
++	 * the one as of the other
++	 */
++	if (edma->num_txcmpl > edma->num_rx)
++		exp_combined = 0;
++
+ 	ret = edma_rx_rings_alloc(ppe_dev);
+ 	if (ret)
+ 		goto err_tx_rings;
+@@ -789,8 +808,9 @@
+ 
+ 	for (i = 0; i < edma->num_rx; i++)
+ 		napi_enable(&edma->rxdesc[i].napi);
+-	for (i = 0; i < edma->num_txcmpl; i++)
++	for (i = 0; !exp_combined && i < edma->num_txcmpl; i++)
+ 		napi_enable(&edma->txcmpl[i].napi);
++	ppe_diag_threads(ppe_dev);
+ 
+ 	for (i = 0; i < edma->num_txcmpl; i++)
+ 		edma_tx_irq_set(&edma->txcmpl[i], true);
+@@ -836,7 +856,7 @@
+ 	for (i = 0; i < edma->num_rx; i++)
+ 		edma_rx_irq_set(&edma->rxdesc[i], false);
+ 
+-	for (i = 0; i < edma->num_txcmpl; i++)
++	for (i = 0; !exp_combined && i < edma->num_txcmpl; i++)
+ 		napi_disable(&edma->txcmpl[i].napi);
+ 	for (i = 0; i < edma->num_rx; i++)
+ 		napi_disable(&edma->rxdesc[i].napi);
+diff -u -r -N a/ipq807x/edma_regs.h b/ipq807x/edma_regs.h
+--- a/ipq807x/edma_regs.h	2026-11-27 08:58:58.494000044 -0700
++++ b/ipq807x/edma_regs.h	2026-11-27 13:52:59.526494236 -0700
+@@ -160,9 +160,9 @@
+  * be the first to fill with full-sized frames. A TX completion ring reports
+  * for a TX ring of every port; when it is full the hardware waits.
+  */
+-#define EDMA_TX_RING_SIZE 1024
+-#define EDMA_TXCMPL_RING_SIZE 4096
+-#define EDMA_RX_RING_SIZE 2048
++#define EDMA_TX_RING_SIZE exp_tx_ring
++#define EDMA_TXCMPL_RING_SIZE exp_txcmpl_ring
++#define EDMA_RX_RING_SIZE exp_rx_ring
+ #define EDMA_TX_RING_THRESH 16
+ 
+ /* A ring slot is eight bytes whatever the ring */
+diff -u -r -N a/ipq807x/edma_rx.c b/ipq807x/edma_rx.c
+--- a/ipq807x/edma_rx.c	2026-11-27 08:58:58.494294217 -0700
++++ b/ipq807x/edma_rx.c	2026-11-27 13:52:59.527184232 -0700
+@@ -20,36 +20,69 @@
+ #include "ppe.h"
+ #include "edma_regs.h"
+ 
++static int edma_rx_clean(struct edma_ring *ring, int budget);
++
+ /* @ring is an RX ring. Its fill ring's interrupt goes with its own. */
+ void edma_rx_irq_set(struct edma_ring *ring, bool enable)
+ {
+-	struct regmap *regmap = ring->ppe_dev->regmap;
++	struct ppe_device *ppe_dev = ring->ppe_dev;
+ 
+-	regmap_write(regmap,
+-		     EDMA_BASE_OFFSET + EDMA_REG_RXFILL_INT_MASK(ring->fill->id),
+-		     enable ? EDMA_RXFILL_INT_MASK : 0);
+-	regmap_write(regmap,
+-		     EDMA_BASE_OFFSET + EDMA_REG_RXDESC_INT_MASK(ring->id),
+-		     enable ? EDMA_RXDESC_INT_MASK_PKT_INT : 0);
++	edma_hot_write(ppe_dev,
++		       EDMA_BASE_OFFSET + EDMA_REG_RXFILL_INT_MASK(ring->fill->id),
++		       enable ? EDMA_RXFILL_INT_MASK : 0);
++	edma_hot_write(ppe_dev,
++		       EDMA_BASE_OFFSET + EDMA_REG_RXDESC_INT_MASK(ring->id),
++		       enable ? EDMA_RXDESC_INT_MASK_PKT_INT : 0);
+ }
+ 
+ /* Shared by an RX ring's and its fill ring's interrupt lines. */
+ irqreturn_t edma_rx_irq(int irq, void *ctx)
+ {
+ 	struct edma_ring *ring = ctx;
+-	struct regmap *regmap = ring->ppe_dev->regmap;
++	struct ppe_device *ppe_dev = ring->ppe_dev;
+ 	u32 rxdesc_stat, rxfill_stat;
+ 
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET + EDMA_REG_RXDESC_INT_STAT(ring->id),
+-		    &rxdesc_stat);
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET + EDMA_REG_RXFILL_INT_STAT(ring->fill->id),
+-		    &rxfill_stat);
++	rxdesc_stat = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++				    EDMA_REG_RXDESC_INT_STAT(ring->id));
++	rxfill_stat = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++				    EDMA_REG_RXFILL_INT_STAT(ring->fill->id));
+ 	if (!rxdesc_stat && !rxfill_stat)
+ 		return IRQ_NONE;
+ 
++	/* E-0007 experiment only, exp_rx_hardirq: the ring is dealt with right
++	 * here; the frames wait in diag_rxq for the poll, which hands them to
++	 * the stack. The interrupt is not masked: it comes again, no sooner
++	 * than the moderation timer lets it, for as long as the ring holds
++	 * something.
++	 */
++	if (exp_rx_hardirq) {
++		int room = (int)exp_rx_swq -
++			   (int)skb_queue_len_lockless(&ring->diag_rxq);
++		int done;
++
++		/* No room for more frames: they stay in the ring, where the
++		 * hardware holds the sender back, and the interrupt stays
++		 * masked until the poll has made room
++		 */
++		if (room <= 0) {
++			edma_rx_irq_set(ring, false);
++			WRITE_ONCE(ring->diag_irq_off, true);
++			napi_schedule(&ring->napi);
++
++			return IRQ_HANDLED;
++		}
++
++		diag_irq(ring);
++		diag_poll_begin(ring, false);
++		done = edma_rx_clean(ring, min_t(int, exp_hardirq_budget, room));
++		diag_poll_end(ring, done, exp_hardirq_budget, ring->diag.cur.q_out);
++		napi_schedule(&ring->napi);
++
++		return IRQ_HANDLED;
++	}
++
+ 	edma_rx_irq_set(ring, false);
++	diag_irq(ring);
+ 
+ 	if (likely(napi_schedule_prep(&ring->napi)))
+ 		__napi_schedule(&ring->napi);
+@@ -89,6 +122,9 @@
+ 		ret = edma_ring_alloc(ppe_dev, rx, EDMA_RX_RING_SIZE);
+ 		if (ret)
+ 			goto err;
++
++		skb_queue_head_init(&rx->diag_rxq);
++		rx->diag_free = kcalloc(EDMA_RX_RING_SIZE, sizeof(u16), GFP_KERNEL);
+ 	}
+ 
+ 	return 0;
+@@ -113,6 +149,12 @@
+ 		rx = &edma->rxdesc[i];
+ 		fill = &edma->rxfill[i];
+ 
++		if (rx->ppe_dev)
++			skb_queue_purge(&rx->diag_rxq);
++		kfree(rx->diag_free);
++		rx->diag_free = NULL;
++		rx->diag_free_n = 0;
++
+ 		if (rx->frame)
+ 			dev_kfree_skb_any(rx->frame);
+ 		rx->frame = NULL;
+@@ -148,6 +190,8 @@
+ 	dma = page_pool_get_dma_addr(page) + NET_SKB_PAD;
+ 	rxph = page_address(page) + NET_SKB_PAD;
+ 	rxph->opaque = cpu_to_le32(store_idx);
++	if (exp_page_idx)
++		*(u32 *)page_address(page) = store_idx;
+ 	dma_sync_single_for_device(ppe_dev->dev, dma, sizeof(rxph->opaque),
+ 				   DMA_FROM_DEVICE);
+ 
+@@ -242,7 +286,7 @@
+ 
+ 		regmap_write(regmap,
+ 			     EDMA_BASE_OFFSET + EDMA_REG_RX_MOD_TIMER(rx->id),
+-			     EDMA_RX_MOD_TIMER_INIT);
++			     exp_rx_mod);
+ 		regmap_write(regmap,
+ 			     EDMA_BASE_OFFSET + EDMA_REG_RX_INT_CTRL(rx->id),
+ 			     0x2);
+@@ -256,8 +300,8 @@
+  * is not the one the page was noted under, look for the page itself: a
+  * buffer that continues a frame carries no pre-header.
+  */
+-static int edma_rx_page_take(struct edma_ring *fill, struct page *page,
+-			     u32 store_idx)
++static int edma_rx_page_take(struct edma_ring *ring, struct edma_ring *fill,
++			     struct page *page, u32 store_idx)
+ {
+ 	int i;
+ 
+@@ -267,14 +311,18 @@
+ 		return store_idx;
+ 	}
+ 
++	ring->diag.scans++;
+ 	for (i = 0; i < fill->count; i++) {
+ 		if (fill->page_store[i] != page)
+ 			continue;
+ 
+ 		fill->page_store[i] = NULL;
++		ring->diag.cur.scan += i + 1;
+ 		return i;
+ 	}
+ 
++	ring->diag.cur.scan += fill->count;
++
+ 	return -1;
+ }
+ 
+@@ -318,7 +366,6 @@
+ static int edma_rx_clean(struct edma_ring *ring, int budget)
+ {
+ 	struct ppe_device *ppe_dev = ring->ppe_dev;
+-	struct regmap *regmap = ppe_dev->regmap;
+ 	struct edma_ring *fill = ring->fill;
+ 	struct edma_preheader *rxph;
+ 	struct edma_rxdesc *desc;
+@@ -326,23 +373,51 @@
+ 	struct ppe_port *port;
+ 	struct sk_buff *skb;
+ 	u16 prod, cons, fill_prod;
+-	u32 status, val;
+-	bool more, first;
++	u32 status, lag;
++	bool more, first, skip_fill;
++	bool refilled = false;
++	bool hard = in_hardirq();
+ 	int store_idx;
+ 	int pkt_len;
+ 	int done = 0;
+ 
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET + EDMA_REG_RXDESC_PROD_IDX(ring->id), &val);
+-	prod = val & EDMA_RXDESC_PROD_IDX_MASK;
++	prod = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++			     EDMA_REG_RXDESC_PROD_IDX(ring->id)) &
++	       EDMA_RXDESC_PROD_IDX_MASK;
++
++	if (ring->diag_lagging) {
++		cons = ring->cons;
++		fill_prod = fill->prod;
++	} else {
++		cons = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++				     EDMA_REG_RXDESC_CONS_IDX(ring->id)) &
++		       EDMA_RXDESC_CONS_IDX_MASK;
++		fill_prod = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++					  EDMA_REG_RXFILL_PROD_IDX(fill->id)) &
++			    EDMA_RXFILL_PROD_IDX_MASK & (fill->count - 1);
++	}
++
++	ring->diag.cur.q_in = (prod - cons) & (ring->count - 1);
++	ring->diag.cur.p_in = prod;
++	ring->diag.cur.c_in = cons;
+ 
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET + EDMA_REG_RXDESC_CONS_IDX(ring->id), &val);
+-	cons = val & EDMA_RXDESC_CONS_IDX_MASK;
++	/* exp_fill_every: what the polls before this one did not put back
++	 * goes back now, all at once
++	 */
++	skip_fill = exp_fill_every > 1 && ring->diag_free &&
++		    ++ring->diag_poll_no % exp_fill_every &&
++		    ring->diag_free_n + budget <= fill->count / 2;
++	while (!skip_fill && ring->diag_free_n) {
++		new_page = page_pool_dev_alloc_pages(fill->page_pool);
++		if (!new_page)
++			break;
+ 
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET + EDMA_REG_RXFILL_PROD_IDX(fill->id), &val);
+-	fill_prod = val & EDMA_RXFILL_PROD_IDX_MASK & (fill->count - 1);
++		edma_rx_fill_slot(fill, new_page, fill_prod,
++				  ring->diag_free[--ring->diag_free_n]);
++		fill_prod = (fill_prod + 1) & (fill->count - 1);
++		ring->diag.cur.refill++;
++		refilled = true;
++	}
+ 
+ 	while (cons != prod && done < budget) {
+ 		desc = ring->desc;
+@@ -362,7 +437,9 @@
+ 					   min_t(u32, EDMA_PREHDR_SIZE + pkt_len,
+ 						 ppe_dev->edma.rx_buffer_size));
+ 
+-		store_idx = edma_rx_page_take(fill, page,
++		store_idx = edma_rx_page_take(ring, fill, page,
++					      exp_page_idx ?
++					      *(u32 *)page_address(page) :
+ 					      le32_to_cpu(rxph->opaque));
+ 		if (unlikely(store_idx < 0)) {
+ 			/* It may belong to a packet already, so it can
+@@ -378,6 +455,26 @@
+ 			goto drop_frame;
+ 		}
+ 
++		/* E-0007 experiment only. From a hard interrupt a page cannot
++		 * go back to its pool: a buffer that is dropped goes back to
++		 * the hardware as it is.
++		 */
++		if (hard && (ring->frame_drop ||
++			     (first && (!edma_rx_port(ppe_dev, page) ||
++					((diag_on || exp_rx_drop_port) &&
++					 diag_rx_frame(ring, (void *)rxph + EDMA_PREHDR_SIZE,
++						       pkt_len)))))) {
++			edma_rx_fill_slot(fill, page, fill_prod, store_idx);
++			fill_prod = (fill_prod + 1) & (fill->count - 1);
++			ring->frame_drop = more;
++			goto next;
++		}
++
++		if (skip_fill) {
++			ring->diag_free[ring->diag_free_n++] = store_idx;
++			goto filled;
++		}
++
+ 		new_page = page_pool_dev_alloc_pages(fill->page_pool);
+ 		if (unlikely(!new_page)) {
+ 			/* No page to replace this one with: the frame goes
+@@ -399,7 +496,9 @@
+ 
+ 		edma_rx_fill_slot(fill, new_page, fill_prod, store_idx);
+ 		fill_prod = (fill_prod + 1) & (fill->count - 1);
++		ring->diag.cur.refill++;
+ 
++filled:
+ 		/* The rest of a frame that is being dropped */
+ 		if (unlikely(ring->frame_drop)) {
+ 			page_pool_put_full_page(fill->page_pool, page, true);
+@@ -407,6 +506,13 @@
+ 			goto next;
+ 		}
+ 
++		if (first && !hard && (diag_on || exp_rx_drop_port) &&
++		    diag_rx_frame(ring, (void *)rxph + EDMA_PREHDR_SIZE, pkt_len)) {
++			page_pool_put_full_page(fill->page_pool, page, true);
++			ring->frame_drop = more;
++			goto next;
++		}
++
+ 		if (first) {
+ 			port = edma_rx_port(ppe_dev, page);
+ 			if (unlikely(!port)) {
+@@ -421,11 +527,15 @@
+ 				goto next;
+ 			}
+ 
+-			skb = napi_build_skb(page_address(page),
+-					     page_size(page));
++			skb = hard ? build_skb(page_address(page), page_size(page)) :
++				     napi_build_skb(page_address(page),
++						    page_size(page));
+ 			if (unlikely(!skb)) {
+-				page_pool_put_full_page(fill->page_pool, page,
+-							true);
++				if (hard)
++					ring->diag.leaked++;
++				else
++					page_pool_put_full_page(fill->page_pool,
++								page, true);
+ 				DEV_STATS_INC(port->netdev, rx_dropped);
+ 				ring->frame_drop = more;
+ 				goto next;
+@@ -440,8 +550,11 @@
+ 			skb = ring->frame;
+ 			if (unlikely(skb_shinfo(skb)->nr_frags >=
+ 				     MAX_SKB_FRAGS)) {
+-				page_pool_put_full_page(fill->page_pool, page,
+-							true);
++				if (hard)
++					ring->diag.leaked++;
++				else
++					page_pool_put_full_page(fill->page_pool,
++								page, true);
+ 				ring->rx_frame_err++;
+ 				DEV_STATS_INC(skb->dev, rx_dropped);
+ 				goto drop_frame;
+@@ -459,7 +572,14 @@
+ 		ring->frame = NULL;
+ 		skb->protocol = eth_type_trans(skb, skb->dev);
+ 		ring->rx_packets++;
+-		napi_gro_receive(&ring->napi, skb);
++		if (!hard) {
++			napi_gro_receive(&ring->napi, skb);
++		} else if (skb_queue_len_lockless(&ring->diag_rxq) < exp_rx_swq) {
++			skb_queue_tail(&ring->diag_rxq, skb);
++		} else {
++			ring->diag.swq_drop++;
++			dev_kfree_skb_irq(skb);
++		}
+ 		goto next;
+ 
+ drop_frame:
+@@ -476,52 +596,66 @@
+ 		done++;
+ 	}
+ 
+-	if (done) {
++	if (done || refilled) {
+ 		/* The new buffers go to the hardware first, then it is told
+ 		 * that the slots up to cons have been taken over.
+ 		 */
+ 		wmb();
+-		regmap_write(regmap,
+-			     EDMA_BASE_OFFSET + EDMA_REG_RXFILL_PROD_IDX(fill->id),
+-			     fill_prod & EDMA_RXFILL_PROD_IDX_MASK);
+-		regmap_write(regmap,
+-			     EDMA_BASE_OFFSET + EDMA_REG_RXDESC_CONS_IDX(ring->id),
+-			     cons);
++		ring->cons = cons;
++		fill->prod = fill_prod;
++		ring->diag_lagging = exp_fill_lag || exp_cons_lag;
++		lag = min_t(u32, exp_fill_lag, fill->count / 2);
++		edma_hot_write(ppe_dev,
++			       EDMA_BASE_OFFSET + EDMA_REG_RXFILL_PROD_IDX(fill->id),
++			       (fill_prod - lag) & (fill->count - 1) &
++			       EDMA_RXFILL_PROD_IDX_MASK);
++		lag = min_t(u32, exp_cons_lag, ring->count / 2);
++		edma_hot_write(ppe_dev,
++			       EDMA_BASE_OFFSET + EDMA_REG_RXDESC_CONS_IDX(ring->id),
++			       (cons + ring->count - lag) % ring->count);
++	}
++
++	if (ring->diag.cur.start) {
++		ring->diag.cur.p_out = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++						     EDMA_REG_RXDESC_PROD_IDX(ring->id)) &
++				       EDMA_RXDESC_PROD_IDX_MASK;
++		ring->diag.cur.c_out = cons;
++		ring->diag.cur.q_out = (ring->diag.cur.p_out - cons) &
++				       (ring->count - 1);
+ 	}
+ 
+ 	return done;
+ }
+ 
+-int edma_rx_poll(struct napi_struct *napi, int budget)
++/* What the poll does for the RX ring itself. Says whether nothing is left to
++ * do, so that the poll may end.
++ */
++static bool edma_rx_poll_ring(struct edma_ring *ring, int budget, int *done)
+ {
+-	struct edma_ring *ring = container_of(napi, struct edma_ring, napi);
+-	struct regmap *regmap = ring->ppe_dev->regmap;
++	struct ppe_device *ppe_dev = ring->ppe_dev;
+ 	struct edma_ring *fill = ring->fill;
+ 	u32 rxdesc_stat, rxfill_stat, prod, cons;
+-	int done;
+ 
+-	done = edma_rx_clean(ring, budget);
+-	if (done >= budget)
+-		return budget;
+-
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET + EDMA_REG_RXDESC_INT_STAT(ring->id),
+-		    &rxdesc_stat);
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET + EDMA_REG_RXFILL_INT_STAT(fill->id),
+-		    &rxfill_stat);
++	*done = edma_rx_clean(ring, budget);
++	if (*done >= budget)
++		return false;
++
++	rxdesc_stat = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++				    EDMA_REG_RXDESC_INT_STAT(ring->id));
++	rxfill_stat = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++				    EDMA_REG_RXFILL_INT_STAT(fill->id));
+ 	if (rxdesc_stat || rxfill_stat)
+-		return budget;
++		return false;
+ 
+ 	/* A fill ring without a single buffer stops every RX ring as soon as
+ 	 * a frame is due for it, and only buffers get it going again. Its
+ 	 * interrupt cannot be relied on, so keep polling until there are
+ 	 * some.
+ 	 */
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET + EDMA_REG_RXFILL_PROD_IDX(fill->id), &prod);
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET + EDMA_REG_RXFILL_CONS_IDX(fill->id), &cons);
++	prod = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++			     EDMA_REG_RXFILL_PROD_IDX(fill->id));
++	cons = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++			     EDMA_REG_RXFILL_CONS_IDX(fill->id));
+ 	if ((prod & (fill->count - 1)) == (cons & (fill->count - 1))) {
+ 		/* Counted and reported once for each time the ring runs
+ 		 * empty, not for each poll that finds it still empty
+@@ -533,16 +667,83 @@
+ 		}
+ 		dev_warn_ratelimited(ring->ppe_dev->dev,
+ 				     "RX fill ring %u is empty\n", fill->id);
+-		edma_rx_fill(fill);
+-		return budget;
++		if (!ring->diag_lagging)
++			edma_rx_fill(fill);
++		return false;
+ 	}
+ 	if (fill->fill_empty) {
+ 		fill->fill_empty = false;
+ 		edma_fill_empty_note(ring->ppe_dev, fill, false);
+ 	}
+ 
+-	if (napi_complete_done(napi, done))
++	return true;
++}
++
++/* E-0007 experiment only: what a poll did is noted before it ends, so the
++ * note does not hold napi_complete_done() and the unmasking. With
++ * exp_combined the poll also deals with the completion ring that has the RX
++ * ring's index, before the RX ring or after it.
++ */
++int edma_rx_poll(struct napi_struct *napi, int budget)
++{
++	struct edma_ring *ring = container_of(napi, struct edma_ring, napi);
++	struct ppe_device *ppe_dev = ring->ppe_dev;
++	struct edma_ring *cmpl = NULL;
++	bool quiet, tx_quiet = true;
++	int done, tx_done;
++
++	/* exp_rx_hardirq: the interrupt handler has dealt with the ring; only
++	 * hand what it queued to the stack
++	 */
++	if (exp_rx_hardirq) {
++		struct sk_buff *skb;
++
++		diag_in_poll(1);
++		for (done = 0; done < budget; done++) {
++			skb = skb_dequeue(&ring->diag_rxq);
++			if (!skb)
++				break;
++
++			napi_gro_receive(napi, skb);
++		}
++		diag_in_poll(0);
++		if (diag_on)
++			ring->diag.swq_done += done;
++		if (READ_ONCE(ring->diag_irq_off) &&
++		    skb_queue_len_lockless(&ring->diag_rxq) < exp_rx_swq / 2) {
++			WRITE_ONCE(ring->diag_irq_off, false);
++			edma_rx_irq_set(ring, true);
++		}
++		if (done < budget && napi_complete_done(napi, done) &&
++		    !skb_queue_empty_lockless(&ring->diag_rxq))
++			napi_schedule(napi);
++
++		return done;
++	}
++
++	if (exp_combined)
++		cmpl = &ppe_dev->edma.txcmpl[ring - ppe_dev->edma.rxdesc];
++
++	if (exp_combined == 1)
++		tx_quiet = edma_tx_poll_ring(cmpl, budget, &tx_done);
++
++	diag_poll_begin(ring, false);
++	if (exp_rx_delay_us)
++		udelay(min(exp_rx_delay_us, 2000U));
++	quiet = edma_rx_poll_ring(ring, budget, &done);
++	diag_poll_end(ring, done, budget, ring->diag.cur.q_out);
++
++	if (exp_combined > 1)
++		tx_quiet = edma_tx_poll_ring(cmpl, budget, &tx_done);
++
++	if (!quiet || !tx_quiet)
++		return budget;
++
++	if (napi_complete_done(napi, done)) {
+ 		edma_rx_irq_set(ring, true);
++		if (cmpl)
++			edma_tx_irq_set(cmpl, true);
++	}
+ 
+ 	return done;
+ }
+diff -u -r -N a/ipq807x/edma_tx.c b/ipq807x/edma_tx.c
+--- a/ipq807x/edma_tx.c	2026-11-27 08:58:58.494343779 -0700
++++ b/ipq807x/edma_tx.c	2026-11-27 13:52:59.527243044 -0700
+@@ -31,31 +31,49 @@
+ {
+ 	struct ppe_device *ppe_dev = ring->ppe_dev;
+ 
+-	regmap_write(ppe_dev->regmap,
+-		     EDMA_BASE_OFFSET +
+-		     EDMA_REG_TX_INT_MASK(ppe_dev->soc->edma_tx_int_base,
+-					  ring->id),
+-		     enable ? EDMA_TX_INT_MASK : 0);
++	edma_hot_write(ppe_dev,
++		       EDMA_BASE_OFFSET +
++		       EDMA_REG_TX_INT_MASK(ppe_dev->soc->edma_tx_int_base,
++					    ring->id),
++		       enable ? EDMA_TX_INT_MASK : 0);
+ }
+ 
+ irqreturn_t edma_tx_irq(int irq, void *ctx)
+ {
+ 	struct edma_ring *ring = ctx;
+ 	struct ppe_device *ppe_dev = ring->ppe_dev;
++	struct edma_ring *owner = ring;
+ 	u32 stat;
+ 
+-	regmap_read(ppe_dev->regmap,
+-		    EDMA_BASE_OFFSET +
+-		    EDMA_REG_TX_INT_STAT(ppe_dev->soc->edma_tx_int_base,
+-					 ring->id),
+-		    &stat);
++	stat = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++			     EDMA_REG_TX_INT_STAT(ppe_dev->soc->edma_tx_int_base,
++						  ring->id));
+ 	if (!stat)
+ 		return IRQ_NONE;
+ 
++	/* E-0007 experiment only, exp_tx_hardirq: the completions are dealt
++	 * with right here and the interrupt is not masked
++	 */
++	if (exp_tx_hardirq) {
++		int done;
++
++		diag_irq(ring);
++		edma_tx_poll_ring(ring, exp_hardirq_budget, &done);
++
++		return IRQ_HANDLED;
++	}
++
+ 	edma_tx_irq_set(ring, false);
+ 
+-	if (likely(napi_schedule_prep(&ring->napi)))
+-		__napi_schedule(&ring->napi);
++	/* E-0007 experiment only: with exp_combined the RX ring's poll
++	 * deals with this ring
++	 */
++	if (exp_combined)
++		owner = &ppe_dev->edma.rxdesc[ring - ppe_dev->edma.txcmpl];
++	diag_irq(ring);
++
++	if (likely(napi_schedule_prep(&owner->napi)))
++		__napi_schedule(&owner->napi);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -89,10 +107,15 @@
+ 
+ 	for (i = 0; i < ARRAY_SIZE(ppe_dev->ports); i++) {
+ 		port = ppe_dev->ports[i];
+-		if (!port || i >= soc->first_xgmac_port)
++		if (!port)
++			continue;
++
++		if (i >= soc->first_xgmac_port) {
++			port->tx_cmpl_base = exp_cmpl_shift % edma->num_txcmpl;
+ 			continue;
++		}
+ 
+-		port->tx_cmpl_base = gmacs++ * port->num_txq %
++		port->tx_cmpl_base = (gmacs++ * port->num_txq + exp_cmpl_shift) %
+ 				     edma->num_txcmpl;
+ 	}
+ 
+@@ -230,7 +253,7 @@
+ 			     EDMA_BASE_OFFSET +
+ 			     EDMA_REG_TX_MOD_TIMER(soc->edma_tx_int_base,
+ 						   ring->id),
+-			     EDMA_TX_MOD_TIMER);
++			     exp_tx_mod);
+ 		regmap_write(regmap,
+ 			     EDMA_BASE_OFFSET +
+ 			     EDMA_REG_TX_INT_CTRL(soc->edma_tx_int_base,
+@@ -242,13 +265,13 @@
+ /* How many slots of a TX ring the driver may still fill */
+ static u16 edma_tx_ring_free_slots(struct edma_ring *ring)
+ {
+-	struct regmap *regmap = ring->ppe_dev->regmap;
++	struct ppe_device *ppe_dev = ring->ppe_dev;
+ 	u32 prod, cons;
+ 
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET + EDMA_REG_TXDESC_PROD_IDX(ring->id), &prod);
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET + EDMA_REG_TXDESC_CONS_IDX(ring->id), &cons);
++	prod = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++			     EDMA_REG_TXDESC_PROD_IDX(ring->id));
++	cons = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++			     EDMA_REG_TXDESC_CONS_IDX(ring->id));
+ 
+ 	/* A slot the hardware is done with still holds its packet until the
+ 	 * completion of that packet has been dealt with. While the slot the
+@@ -283,9 +306,9 @@
+ static void edma_tx_ring_kick(struct edma_ring *ring)
+ {
+ 	wmb();
+-	regmap_write(ring->ppe_dev->regmap,
+-		     EDMA_BASE_OFFSET + EDMA_REG_TXDESC_PROD_IDX(ring->id),
+-		     ring->prod);
++	edma_hot_write(ring->ppe_dev,
++		       EDMA_BASE_OFFSET + EDMA_REG_TXDESC_PROD_IDX(ring->id),
++		       ring->prod);
+ }
+ 
+ /* The stack hands packets over in runs and says for each whether more follow;
+@@ -324,7 +347,6 @@
+ 	struct netdev_queue *txq = netdev_get_tx_queue(netdev, queue);
+ 	struct edma_ring *ring = edma_tx_ring_get(ppe_dev, port->port_id,
+ 						  queue);
+-	struct regmap *regmap = ppe_dev->regmap;
+ 	struct edma_preheader *txph;
+ 	struct edma_txdesc *desc;
+ 	u16 prod, cons, next;
+@@ -338,9 +360,8 @@
+ 
+ 	if (((ring->cons - next - 1) & (ring->count - 1)) <
+ 	    EDMA_TX_RING_THRESH) {
+-		regmap_read(regmap,
+-			    EDMA_BASE_OFFSET + EDMA_REG_TXDESC_CONS_IDX(ring->id),
+-			    &val);
++		val = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++				    EDMA_REG_TXDESC_CONS_IDX(ring->id));
+ 		ring->cons = val & EDMA_TXDESC_CONS_IDX_MASK &
+ 			     (ring->count - 1);
+ 	}
+@@ -420,7 +441,6 @@
+ 	struct ppe_device *ppe_dev = cmpl_ring->ppe_dev;
+ 	const struct ppe_soc_data *soc = ppe_dev->soc;
+ 	struct edma *edma = &ppe_dev->edma;
+-	struct regmap *regmap = ppe_dev->regmap;
+ 	int cmpl_idx = cmpl_ring - edma->txcmpl;
+ 	unsigned int pkts[PPE_NUM_PORTS] = {};
+ 	unsigned int bytes[PPE_NUM_PORTS] = {};
+@@ -430,24 +450,26 @@
+ 	struct edma_ring *ring;
+ 	struct ppe_port *port;
+ 	struct sk_buff *skb;
+-	u32 val, opaque, ring_id, slot;
++	u32 opaque, ring_id, slot;
+ 	u16 prod, cons;
++	unsigned int extra;
+ 	int done = 0;
+ 	int i;
+ 
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET +
+-		    EDMA_REG_TXCMPL_PROD_IDX(soc->edma_txcmpl_base,
+-					     cmpl_ring->id),
+-		    &val);
+-	prod = val & EDMA_TXCMPL_PROD_IDX_MASK;
+-
+-	regmap_read(regmap,
+-		    EDMA_BASE_OFFSET +
+-		    EDMA_REG_TXCMPL_CONS_IDX(soc->edma_txcmpl_base,
+-					     cmpl_ring->id),
+-		    &val);
+-	cons = val & EDMA_TXCMPL_CONS_IDX_MASK;
++	prod = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++			     EDMA_REG_TXCMPL_PROD_IDX(soc->edma_txcmpl_base,
++						      cmpl_ring->id)) &
++	       EDMA_TXCMPL_PROD_IDX_MASK;
++	cons = edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++			     EDMA_REG_TXCMPL_CONS_IDX(soc->edma_txcmpl_base,
++						      cmpl_ring->id)) &
++	       EDMA_TXCMPL_CONS_IDX_MASK;
++	cmpl_ring->diag.cur.q_in = (prod - cons) & (cmpl_ring->count - 1);
++	cmpl_ring->diag.cur.q_out = cmpl_ring->diag.cur.q_in;
++	cmpl_ring->diag.cur.p_in = prod;
++	cmpl_ring->diag.cur.c_in = cons;
++	cmpl_ring->diag.cur.p_out = prod;
++	cmpl_ring->diag.cur.c_out = cons;
+ 
+ 	while (cons != prod && done < budget) {
+ 		cmpl = cmpl_ring->desc;
+@@ -477,7 +499,10 @@
+ 			port = netdev_priv(skb->dev);
+ 			pkts[port->port_id]++;
+ 			bytes[port->port_id] += skb->len - EDMA_PREHDR_SIZE;
+-			napi_consume_skb(skb, budget);
++			if (in_hardirq())
++				dev_consume_skb_irq(skb);
++			else
++				napi_consume_skb(skb, budget);
+ 		}
+ 
+ 		if (++cons == cmpl_ring->count)
+@@ -491,11 +516,21 @@
+ 
+ 	/* The entries have been dealt with before the hardware is told so */
+ 	wmb();
+-	regmap_write(regmap,
+-		     EDMA_BASE_OFFSET +
+-		     EDMA_REG_TXCMPL_CONS_IDX(soc->edma_txcmpl_base,
+-					      cmpl_ring->id),
+-		     cons);
++	edma_hot_write(ppe_dev,
++		       EDMA_BASE_OFFSET +
++		       EDMA_REG_TXCMPL_CONS_IDX(soc->edma_txcmpl_base,
++						cmpl_ring->id),
++		       cons);
++	if (cmpl_ring->diag.cur.start) {
++		cmpl_ring->diag.cur.p_out =
++			edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++				      EDMA_REG_TXCMPL_PROD_IDX(soc->edma_txcmpl_base,
++							       cmpl_ring->id)) &
++			EDMA_TXCMPL_PROD_IDX_MASK;
++		cmpl_ring->diag.cur.c_out = cons;
++		cmpl_ring->diag.cur.q_out = (cmpl_ring->diag.cur.p_out - cons) &
++					    (cmpl_ring->count - 1);
++	}
+ 
+ 	/* This completion ring reports for one TX ring of every port that
+ 	 * uses it. What this round completed for a port is
+@@ -520,8 +555,9 @@
+ 			continue;
+ 
+ 		/* The port's TX queue that reports to this completion ring */
+-		q = cmpl_idx - port->tx_cmpl_base;
+-		if (q < 0 || q >= port->num_txq)
++		q = (cmpl_idx + edma->num_txcmpl - port->tx_cmpl_base) %
++		    edma->num_txcmpl;
++		if (q >= port->num_txq)
+ 			continue;
+ 
+ 		txq = netdev_get_tx_queue(port->netdev, q);
+@@ -534,30 +570,57 @@
+ 		ring = edma_tx_ring_get(ppe_dev, i, q);
+ 		if (edma_tx_ring_free_slots(ring) > EDMA_TX_RING_THRESH) {
+ 			port->tx_ring_woken[q]++;
++			cmpl_ring->diag.cur.woken++;
+ 			netif_tx_wake_queue(txq);
+ 		}
+ 	}
+ 
++	/* E-0007 experiment only, exp_tx_scan_extra: walk the ports again
++	 * without doing anything, to tell what the walk itself costs
++	 */
++	for (extra = READ_ONCE(exp_tx_scan_extra); extra; extra--) {
++		for (i = 0; i < ARRAY_SIZE(ppe_dev->ports); i++) {
++			port = ppe_dev->ports[i];
++			if (!port)
++				continue;
++
++			txq = netdev_get_tx_queue(port->netdev, 0);
++			if (netif_tx_queue_stopped(txq) && !netif_running(port->netdev))
++				barrier();
++		}
++	}
++
+ 	return done;
+ }
+ 
++/* What a poll does for a completion ring. Says whether nothing is left to
++ * do. E-0007 experiment only: exp_tx_budget, and the note of what was done.
++ */
++bool edma_tx_poll_ring(struct edma_ring *ring, int budget, int *done)
++{
++	struct ppe_device *ppe_dev = ring->ppe_dev;
++	bool quiet;
++
++	if (exp_tx_budget)
++		budget = min_t(int, budget, exp_tx_budget);
++
++	diag_poll_begin(ring, true);
++	*done = edma_tx_clean(ring, budget);
++	quiet = *done < budget &&
++		!edma_hot_read(ppe_dev, EDMA_BASE_OFFSET +
++			       EDMA_REG_TX_INT_STAT(ppe_dev->soc->edma_tx_int_base,
++						    ring->id));
++	diag_poll_end(ring, *done, budget, ring->diag.cur.q_out);
++
++	return quiet;
++}
++
+ int edma_tx_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct edma_ring *ring = container_of(napi, struct edma_ring, napi);
+-	struct ppe_device *ppe_dev = ring->ppe_dev;
+ 	int done;
+-	u32 stat;
+-
+-	done = edma_tx_clean(ring, budget);
+-	if (done >= budget)
+-		return budget;
+ 
+-	regmap_read(ppe_dev->regmap,
+-		    EDMA_BASE_OFFSET +
+-		    EDMA_REG_TX_INT_STAT(ppe_dev->soc->edma_tx_int_base,
+-					 ring->id),
+-		    &stat);
+-	if (stat)
++	if (!edma_tx_poll_ring(ring, budget, &done))
+ 		return budget;
+ 
+ 	if (napi_complete_done(napi, done))
+diff -u -r -N a/ipq807x/Makefile b/ipq807x/Makefile
+--- a/ipq807x/Makefile	2026-11-27 08:58:58.494172617 -0700
++++ b/ipq807x/Makefile	2026-11-27 13:52:59.526458606 -0700
+@@ -2,4 +2,4 @@
+ 
+ obj-$(CONFIG_QCOM_IPQ807X_ETH) += ipq807x-eth.o
+ ipq807x-eth-objs := ppe.o ppe_config.o ppe_port.o ppe_netdev.o ppe_ethtool.o \
+-		    ppe_devlink.o edma.o edma_rx.o edma_tx.o
++		    ppe_devlink.o edma.o edma_rx.o edma_tx.o ppe_diag.o
+diff -u -r -N a/ipq807x/ppe.c b/ipq807x/ppe.c
+--- a/ipq807x/ppe.c	2026-11-27 08:58:58.494040503 -0700
++++ b/ipq807x/ppe.c	2026-11-27 13:52:59.527036766 -0700
+@@ -106,6 +106,8 @@
+ 		return dev_err_probe(dev, PTR_ERR(ppe_dev->regmap),
+ 				     "cannot create the register map\n");
+ 
++	ppe_dev->diag_base = base;
++
+ 	ret = ppe_devlink_alloc(ppe_dev);
+ 	if (ret)
+ 		return ret;
+@@ -137,6 +139,7 @@
+ 		goto err_health;
+ 
+ 	platform_set_drvdata(pdev, ppe_dev);
++	ppe_diag_init(ppe_dev, base);
+ 
+ 	INIT_DELAYED_WORK(&ppe_dev->stats_work, ppe_port_stats_work);
+ 	schedule_delayed_work(&ppe_dev->stats_work, 0);
+@@ -179,8 +182,10 @@
+ 
+ 	cancel_delayed_work_sync(&ppe_dev->stats_work);
+ 
++	ppe_diag_quiesce();
+ 	ppe_netdev_unregister_all(ppe_dev);
+ 	edma_teardown(ppe_dev);
++	ppe_diag_exit(ppe_dev);
+ 	ppe_health_destroy(ppe_dev);
+ 	ppe_clk_disable(ppe_dev);
+ 	ppe_netdev_destroy_all(ppe_dev);
+diff -u -r -N a/ipq807x/ppe_config.c b/ipq807x/ppe_config.c
+--- a/ipq807x/ppe_config.c	2026-11-27 08:58:58.494419059 -0700
++++ b/ipq807x/ppe_config.c	2026-11-27 17:16:20.102111282 -0700
+@@ -287,7 +287,8 @@
+ 	int i;
+ 
+ 	for (i = 0; i < PPE_BM_PORTS; i++) {
+-		bool fc_en = i < PPE_BM_PHY_START || i > d->bm_phy_end;
++		bool fc_en = (i < PPE_BM_PHY_START && !exp_no_fc) ||
++			     i > d->bm_phy_end;
+ 
+ 		regmap_write(ppe_dev->regmap, PPE_BM_FC_MODE(i),
+ 			     fc_en ? PPE_BM_FC_EN : 0);
+@@ -295,9 +296,12 @@
+ 	}
+ 
+ 	regmap_write(ppe_dev->regmap, PPE_BM_SHARED_GRP(0),
+-		     FIELD_PREP(PPE_BM_SHARED_LIMIT, d->bm_group_buf));
++		     FIELD_PREP(PPE_BM_SHARED_LIMIT,
++				exp_bm_group ?: d->bm_group_buf));
+ 
+ 	for (i = 0; i < PPE_BM_PORTS; i++) {
++		bool phy = i >= PPE_BM_PHY_START && i < d->bm_internal_start;
++		u16 ceiling = phy && exp_bm_ceiling ? exp_bm_ceiling : d->bm_ceiling;
+ 		u16 react;
+ 		u32 w0, w1;
+ 
+@@ -306,13 +310,15 @@
+ 		else if (i >= d->bm_internal_start)
+ 			react = 40;
+ 		else
+-			react = 128;
++			react = exp_bm_react ?: 128;
+ 
+ 		w0 = FIELD_PREP(PPE_BM_REACT_LIMIT, react) |
+-		     FIELD_PREP(PPE_BM_RESUME_OFF, 36) |
+-		     FIELD_PREP(PPE_BM_CEILING_LO, d->bm_ceiling & 0x7);
+-		w1 = FIELD_PREP(PPE_BM_CEILING_HI, d->bm_ceiling >> 3) |
+-		     FIELD_PREP(PPE_BM_WEIGHT, 4) |
++		     FIELD_PREP(PPE_BM_RESUME_OFF,
++				phy && exp_bm_resume ? exp_bm_resume : 36) |
++		     FIELD_PREP(PPE_BM_CEILING_LO, ceiling & 0x7);
++		w1 = FIELD_PREP(PPE_BM_CEILING_HI, ceiling >> 3) |
++		     FIELD_PREP(PPE_BM_WEIGHT,
++				phy && exp_bm_weight ? exp_bm_weight : 4) |
+ 		     PPE_BM_DYNAMIC;
+ 
+ 		regmap_write(ppe_dev->regmap, PPE_BM_PORT_FC_W0(i), w0);
+@@ -444,9 +450,21 @@
+ 	for (i = 0; i < PPE_L0_UCAST_QUEUES; i++) {
+ 		regmap_write(ppe_dev->regmap, PPE_QM_AC_UNI_W0(i),
+ 			     PPE_AC_EN |
++			     /* E-0007: bit 2 is the library's ac_cfg_force_ac_en ("ac for
++			      * flow control packets"): without it a queue does not
++			      * drop frames that came in on a port with flow control.
++			      */
++			     (exp_cpu_q_ceiling &&
++			      i >= d->edma_host_queue_base &&
++			      i < d->edma_host_queue_base + EDMA_MAX_RX_GROUPS ?
++			      BIT(2) : 0) |
+ 			     PPE_AC_SHARED_DYNAMIC |
+ 			     FIELD_PREP(PPE_AC_SHARED_WEIGHT, 4) |
+-			     FIELD_PREP(PPE_AC_SHARED_CEILING, d->qm_ceiling));
++			     FIELD_PREP(PPE_AC_SHARED_CEILING,
++					exp_cpu_q_ceiling &&
++					i >= d->edma_host_queue_base &&
++					i < d->edma_host_queue_base + EDMA_MAX_RX_GROUPS ?
++					exp_cpu_q_ceiling : d->qm_ceiling));
+ 		regmap_write(ppe_dev->regmap, PPE_QM_AC_UNI_W1(i), 0);
+ 		regmap_write(ppe_dev->regmap, PPE_QM_AC_UNI_W2(i), 0);
+ 		regmap_write(ppe_dev->regmap, PPE_QM_AC_UNI_W3(i),
+diff -u -r -N a/ipq807x/ppe_diag.c b/ipq807x/ppe_diag.c
+--- a/ipq807x/ppe_diag.c	1969-12-31 16:00:00.000000000 -0800
++++ b/ipq807x/ppe_diag.c	2026-11-27 13:52:59.526392721 -0700
+@@ -0,0 +1,1495 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * E-0007 experiment only. With none of the parameters given the module does
++ * what the driver does; what it records costs nothing until diag_on is set.
++ *
++ * Three things are in here.
++ *
++ * What can be switched to something else than the driver does, by
++ * parameters given when the module is loaded:
++ * exp_no_fc: 1 turns flow control off for the eight buffer manager ports on
++ * the CPU side.
++ * exp_tx_thread: 1 polls the TX completion rings in threads.
++ * exp_rx_softirq: 1 polls the RX rings in softirq context, not in threads.
++ * exp_combined: one poll for RX ring n and TX completion ring n, both of
++ * whose interrupts ask for it; 1 does the completions first, 2 the RX ring
++ * first. It runs where the RX polls run.
++ * exp_rx_weight, exp_tx_weight: how much one poll may do; 0 leaves 64.
++ * exp_cmpl_shift: TX queue q reports to completion ring q + this.
++ * exp_rx_mod, exp_tx_mod: the moderation timers.
++ * exp_rx_ring, exp_tx_ring, exp_txcmpl_ring: the ring sizes, powers of two.
++ * exp_bm_react, exp_bm_ceiling, exp_bm_weight, exp_bm_resume: the thresholds
++ * of the buffer manager's physical ports; exp_bm_group: the shared buffers.
++ * exp_raw_io: 1 reads and writes the registers of the rings without the
++ * register map and so without its lock.
++ * exp_page_idx: 1 notes a page's store index at the start of the page, where
++ * the hardware does not write, not in the pre-header.
++ * exp_sync_len: how much of a page is synced for the device when it goes
++ * back to the pool; 0 leaves the whole buffer.
++ * exp_rx_hardirq: 1 takes the frames out of an RX ring and puts the new
++ * buffers in from the interrupt handler itself; the frames wait in a queue of
++ * the driver's for the RX poll, which only hands them to the stack. When
++ * exp_rx_swq frames wait there the handler takes no more out of the ring and
++ * masks the interrupt until the poll has brought the queue down to half.
++ * exp_defer_irqs, exp_gro_flush_us: a poll that finds nothing left does not
++ * unmask its interrupt at once; the kernel calls it again after
++ * exp_gro_flush_us microseconds, and only after exp_defer_irqs such polls in a
++ * row that found nothing is the interrupt unmasked (the kernel's
++ * napi_defer_hard_irqs and gro_flush_timeout).
++ * exp_cpu_q_ceiling: the most buffers each of the host's four PPE queues may
++ * hold; 0 leaves what the driver writes. Below the threshold at which a port
++ * is told to pause, a queue whose RX ring is full drops its own frames and
++ * the port is not paused.
++ * exp_tx_hardirq: 1 deals with the completions from the interrupt handler
++ * itself. Both do at most exp_hardirq_budget slots for one interrupt.
++ *
++ * And by parameters that can be written while the driver runs:
++ * exp_tx_budget: how many completions one poll deals with at most; 0 leaves
++ * it to the budget.
++ * exp_rx_drop_port: UDP frames to this port or one of the 99 after it are
++ * dropped in the RX poll once their buffer has been replaced.
++ * exp_rx_delay_us: every RX poll first waits this long.
++ * exp_fill_lag: the hardware is told about this many fewer new buffers than
++ * the poll has put into the fill ring.
++ * exp_cons_lag: the hardware is told that this many fewer slots of the RX
++ * ring have been taken over than the poll has.
++ * exp_fill_every: n > 1 puts new buffers into the fill ring only in every
++ * n-th poll, for all the polls since, so that how many buffers a poll puts
++ * back is not how many slots it looks at.
++ * exp_tx_scan_extra: the completion poll walks the ports this many more
++ * times without doing anything.
++ *
++ * What the driver records about itself while diag_on is set: every poll
++ * (struct diag_poll), every packet sent by where it was sent from, and, with
++ * probes on the scheduler's and the interrupt tracepoints, where every CPU's
++ * time went and how long the NAPI threads waited for a CPU.
++ *
++ * A sampler that reads a list of registers at a fixed period from a timer
++ * interrupt, and a watcher that reads up to eight registers as fast as it
++ * can for a while and notes every change. Both read without the register map.
++ *
++ * All of it is read and steered through debugfs, directory ipq807x_diag.
++ */
++
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/hrtimer.h>
++#include <linux/if_ether.h>
++#include <linux/interrupt.h>
++#include <linux/ip.h>
++#include <linux/kthread.h>
++#include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/sched.h>
++#include <linux/seq_file.h>
++#include <linux/skbuff.h>
++#include <linux/tcp.h>
++#include <linux/tracepoint.h>
++#include <linux/udp.h>
++#include <linux/unaligned.h>
++#include <linux/vmalloc.h>
++#include <net/sch_generic.h>
++
++#include "ppe.h"
++#include "edma_regs.h"
++
++unsigned int exp_no_fc;
++module_param(exp_no_fc, uint, 0444);
++unsigned int exp_tx_thread;
++module_param(exp_tx_thread, uint, 0444);
++unsigned int exp_rx_softirq;
++module_param(exp_rx_softirq, uint, 0444);
++unsigned int exp_combined;
++module_param(exp_combined, uint, 0444);
++unsigned int exp_rx_weight;
++module_param(exp_rx_weight, uint, 0444);
++unsigned int exp_tx_weight;
++module_param(exp_tx_weight, uint, 0444);
++unsigned int exp_cmpl_shift;
++module_param(exp_cmpl_shift, uint, 0444);
++unsigned int exp_rx_mod = 1000;
++module_param(exp_rx_mod, uint, 0444);
++unsigned int exp_tx_mod = 150;
++module_param(exp_tx_mod, uint, 0444);
++unsigned int exp_rx_ring = 2048;
++module_param(exp_rx_ring, uint, 0444);
++unsigned int exp_tx_ring = 1024;
++module_param(exp_tx_ring, uint, 0444);
++unsigned int exp_txcmpl_ring = 4096;
++module_param(exp_txcmpl_ring, uint, 0444);
++unsigned int exp_bm_react;
++module_param(exp_bm_react, uint, 0444);
++unsigned int exp_bm_ceiling;
++module_param(exp_bm_ceiling, uint, 0444);
++unsigned int exp_bm_weight;
++module_param(exp_bm_weight, uint, 0444);
++unsigned int exp_bm_group;
++module_param(exp_bm_group, uint, 0444);
++unsigned int exp_bm_resume;
++module_param(exp_bm_resume, uint, 0444);
++unsigned int exp_raw_io;
++module_param(exp_raw_io, uint, 0444);
++unsigned int exp_page_idx;
++module_param(exp_page_idx, uint, 0444);
++unsigned int exp_sync_len;
++module_param(exp_sync_len, uint, 0444);
++unsigned int exp_rx_hardirq;
++module_param(exp_rx_hardirq, uint, 0444);
++unsigned int exp_defer_irqs;
++module_param(exp_defer_irqs, uint, 0444);
++unsigned int exp_gro_flush_us;
++module_param(exp_gro_flush_us, uint, 0444);
++unsigned int exp_cpu_q_ceiling;
++module_param(exp_cpu_q_ceiling, uint, 0444);
++unsigned int exp_tx_hardirq;
++module_param(exp_tx_hardirq, uint, 0444);
++
++bool diag_on;
++module_param(diag_on, bool, 0644);
++bool diag_xmit_time;
++module_param(diag_xmit_time, bool, 0644);
++unsigned int exp_tx_budget;
++module_param(exp_tx_budget, uint, 0644);
++unsigned int exp_rx_drop_port;
++module_param(exp_rx_drop_port, uint, 0644);
++unsigned int exp_rx_delay_us;
++module_param(exp_rx_delay_us, uint, 0644);
++unsigned int exp_fill_lag;
++module_param(exp_fill_lag, uint, 0644);
++unsigned int exp_cons_lag;
++module_param(exp_cons_lag, uint, 0644);
++unsigned int exp_fill_every;
++module_param(exp_fill_every, uint, 0644);
++unsigned int exp_tx_scan_extra;
++module_param(exp_tx_scan_extra, uint, 0644);
++unsigned int exp_hardirq_budget = 256;
++module_param(exp_hardirq_budget, uint, 0644);
++unsigned int exp_rx_swq = 8192;
++module_param(exp_rx_swq, uint, 0644);
++/* A frame with this TCP or UDP port on either side counts as forwarded,
++ * whatever its address: one that comes in from the wan side for a translated
++ * connection still carries the router's own address
++ */
++static unsigned int diag_fwd_port = 5211;
++module_param(diag_fwd_port, uint, 0644);
++
++/* How many polls of each ring are kept */
++static unsigned int diag_cap = 16384;
++module_param(diag_cap, uint, 0444);
++
++/* UDP frames to this port carry a number the host chose: when each was seen
++ * is noted, to tell the host's clock from the router's
++ */
++#define DIAG_MARK_PORT	57351
++#define DIAG_MARKS	64
++
++enum {
++	DIAG_T_IDLE,
++	DIAG_T_RX,
++	DIAG_T_TX,
++	DIAG_T_KSOFTIRQD,
++	DIAG_T_GEN,
++	DIAG_T_KWORKER,
++	DIAG_T_OTHER,
++	DIAG_T_NUM,
++};
++
++static const char * const diag_task_name[DIAG_T_NUM] = {
++	"idle", "rx_thread", "tx_thread", "ksoftirqd", "generator", "kworker",
++	"other",
++};
++
++enum {
++	DIAG_I_RX,
++	DIAG_I_TX,
++	DIAG_I_OTHER,
++	DIAG_I_NUM,
++};
++
++enum {
++	DIAG_X_RXPOLL,
++	DIAG_X_TXPOLL,
++	DIAG_X_NET_TX,
++	DIAG_X_TASKLET,
++	DIAG_X_TIMER,
++	DIAG_X_SOFTIRQ,
++	DIAG_X_GEN,
++	DIAG_X_PROC,
++	DIAG_X_NUM,
++};
++
++static const char * const diag_xmit_name[DIAG_X_NUM] = {
++	"rx_poll", "tx_poll", "net_tx", "tasklet", "timer", "softirq_other",
++	"generator", "process_other",
++};
++
++/* Where one CPU's time went and from where it sent. Only ever touched on
++ * that CPU with interrupts or bottom halves off, but for being read.
++ */
++struct diag_cpu {
++	u64 since;
++	u64 switch_ts;
++	u64 stolen;
++	u64 irq_ts;
++	u64 sirq_ts;
++	u64 sirq_stolen;
++	int cur_vec;
++	u8 cur_class;
++	u8 in_poll;
++
++	u64 irq_ns[DIAG_I_NUM];
++	u64 irq_cnt[DIAG_I_NUM];
++	u64 sirq_ns[NR_SOFTIRQS];
++	u64 sirq_cnt[NR_SOFTIRQS];
++	u64 sirq_ksoftirqd_ns[NR_SOFTIRQS];
++	u64 task_ns[DIAG_T_NUM];
++	u64 task_sw[DIAG_T_NUM];
++
++	u64 x_pkts[DIAG_X_NUM][2];
++	u64 x_bytes[DIAG_X_NUM][2];
++	u64 x_ns[DIAG_X_NUM];
++	u64 x_busy;
++	u64 x_nonlinear;
++	/* Never reset: the polls take differences */
++	u64 x_loc;
++	u64 x_fwd;
++	u64 x_ns_all;
++	u64 x_soft_loc;
++
++	/* How long the generators' tasks that ran here had waited for a CPU */
++	u64 gen_wait_ns;
++	u64 gen_wait_cnt;
++	u64 gen_wait_max;
++	u64 hist_gen_wait[DIAG_HIST];
++};
++
++static DEFINE_PER_CPU(struct diag_cpu, diag_cpu);
++
++/* How long a NAPI thread waited for a CPU: after it was woken, and after it
++ * was taken off a CPU while it still had work
++ */
++struct diag_thread {
++	struct task_struct *task;
++	u64 wait_from;
++	bool preempted;
++	u64 wake_ns;
++	u64 wake_cnt;
++	u64 wake_max;
++	u64 pre_ns;
++	u64 pre_cnt;
++	u64 pre_max;
++	u64 hist_wake[DIAG_HIST];
++	u64 hist_pre[DIAG_HIST];
++};
++
++#define DIAG_THREADS	(2 * EDMA_MAX_RX_GROUPS)
++
++static struct diag_thread diag_thread[DIAG_THREADS];
++
++/* Since when each of the generators' tasks has been waiting for a CPU, by its
++ * PID; two tasks may share a slot, the later one wins
++ */
++#define DIAG_GEN_SLOTS	256
++
++static struct {
++	pid_t pid;
++	u64 from;
++} diag_gen[DIAG_GEN_SLOTS];
++
++/* Every TX queue of every port: what is read of it by the sampler, and the
++ * totals when the window began and when it ended
++ */
++#define DIAG_TXQS		EDMA_NUM_TXDESC_RINGS
++#define DIAG_TXQ_SAMPLE		4
++#define DIAG_TXQ_TOTALS		6
++
++static struct {
++	struct ppe_port *port;
++	u8 queue;
++} diag_txq[DIAG_TXQS];
++static unsigned int diag_ntxq;
++static u64 diag_txq_base[DIAG_TXQS][DIAG_TXQ_TOTALS];
++static u64 diag_txq_end[DIAG_TXQS][DIAG_TXQ_TOTALS];
++static int diag_irq_rx[2 * EDMA_MAX_RX_GROUPS];
++static int diag_irq_tx[EDMA_MAX_TX_QUEUES];
++
++static struct {
++	u32 seq;
++	u64 at;
++} diag_mark[DIAG_MARKS];
++static atomic_t diag_mark_n;
++
++#define DIAG_REGS_MAX	100
++#define DIAG_WREGS_MAX	8
++
++static struct {
++	void __iomem *base;
++	struct ppe_device *ppe_dev;
++	struct dentry *dir;
++
++	u32 regs[DIAG_REGS_MAX];
++	unsigned int nregs;
++	struct hrtimer timer;
++	ktime_t period;
++	u32 *buf;
++	size_t buf_words;
++	unsigned int cap;
++	unsigned int n;
++	unsigned int rec_words;
++	unsigned int rec_regs;
++	bool running;
++	u64 sample_ns;
++	struct debugfs_blob_wrapper blob;
++
++	u32 wregs[DIAG_WREGS_MAX];
++	unsigned int nwregs;
++	struct task_struct *watcher;
++	u64 *wbuf;
++	unsigned int wbuf_cap;
++	unsigned int wcap;
++	unsigned int wn;
++	unsigned int wms;
++	u64 wloops;
++	bool wdone;
++	struct debugfs_blob_wrapper wblob;
++
++	struct debugfs_blob_wrapper ring_blob[2 * EDMA_MAX_RX_GROUPS];
++	bool probes;
++
++	/* A window of recording that ends by itself */
++	struct hrtimer window;
++	u64 win_start;
++	u64 win_stop;
++} diag;
++
++static const char * const diag_tp_name[] = {
++	"sched_switch", "sched_waking", "irq_handler_entry", "irq_handler_exit",
++	"softirq_entry", "softirq_exit",
++};
++
++static struct tracepoint *diag_tp[ARRAY_SIZE(diag_tp_name)];
++
++static void diag_hist_add(u64 *hist, u64 val)
++{
++	hist[min_t(unsigned int, fls64(val), DIAG_HIST - 1)]++;
++}
++
++static struct diag_thread *diag_thread_of(struct task_struct *p)
++{
++	int i;
++
++	for (i = 0; i < DIAG_THREADS; i++)
++		if (diag_thread[i].task == p)
++			return &diag_thread[i];
++
++	return NULL;
++}
++
++static u8 diag_task_class(struct task_struct *p)
++{
++	struct diag_thread *t;
++
++	if (is_idle_task(p))
++		return DIAG_T_IDLE;
++
++	t = diag_thread_of(p);
++	if (t)
++		return t - diag_thread < EDMA_MAX_RX_GROUPS ? DIAG_T_RX :
++							      DIAG_T_TX;
++
++	if (!strncmp(p->comm, "iperf3", 6) || !strncmp(p->comm, "kpktgend", 8))
++		return DIAG_T_GEN;
++	if (!strncmp(p->comm, "ksoftirqd", 9))
++		return DIAG_T_KSOFTIRQD;
++	if (!strncmp(p->comm, "kworker", 7))
++		return DIAG_T_KWORKER;
++
++	return DIAG_T_OTHER;
++}
++
++static void diag_probe_switch(void *data, bool preempt,
++			      struct task_struct *prev,
++			      struct task_struct *next,
++			      unsigned int prev_state)
++{
++	struct diag_cpu *c = this_cpu_ptr(&diag_cpu);
++	struct diag_thread *t;
++	u64 now = diag_now();
++	u64 from, wait;
++
++	if (diag_on) {
++		c->task_ns[c->cur_class] += now - c->switch_ts - c->stolen;
++		c->task_sw[c->cur_class]++;
++	}
++	c->switch_ts = now;
++	c->stolen = 0;
++	c->cur_class = diag_task_class(next);
++
++	if (prev_state == TASK_RUNNING && diag_task_class(prev) == DIAG_T_GEN) {
++		diag_gen[prev->pid % DIAG_GEN_SLOTS].pid = prev->pid;
++		diag_gen[prev->pid % DIAG_GEN_SLOTS].from = now;
++	}
++	if (c->cur_class == DIAG_T_GEN &&
++	    diag_gen[next->pid % DIAG_GEN_SLOTS].pid == next->pid) {
++		from = diag_gen[next->pid % DIAG_GEN_SLOTS].from;
++		diag_gen[next->pid % DIAG_GEN_SLOTS].from = 0;
++		if (from && diag_on) {
++			c->gen_wait_ns += now - from;
++			c->gen_wait_cnt++;
++			c->gen_wait_max = max(c->gen_wait_max, now - from);
++			diag_hist_add(c->hist_gen_wait, now - from);
++		}
++	}
++
++	t = diag_thread_of(prev);
++	if (t) {
++		t->preempted = prev_state == TASK_RUNNING;
++		WRITE_ONCE(t->wait_from, t->preempted ? now : 0);
++	}
++
++	t = diag_thread_of(next);
++	if (!t)
++		return;
++
++	from = READ_ONCE(t->wait_from);
++	if (!from)
++		return;
++
++	WRITE_ONCE(t->wait_from, 0);
++	if (!diag_on)
++		return;
++
++	wait = now - from;
++	if (t->preempted) {
++		t->pre_ns += wait;
++		t->pre_cnt++;
++		t->pre_max = max(t->pre_max, wait);
++		diag_hist_add(t->hist_pre, wait);
++	} else {
++		t->wake_ns += wait;
++		t->wake_cnt++;
++		t->wake_max = max(t->wake_max, wait);
++		diag_hist_add(t->hist_wake, wait);
++	}
++}
++
++static void diag_probe_waking(void *data, struct task_struct *p)
++{
++	struct diag_thread *t = diag_thread_of(p);
++
++	if (!t && diag_task_class(p) == DIAG_T_GEN) {
++		diag_gen[p->pid % DIAG_GEN_SLOTS].pid = p->pid;
++		diag_gen[p->pid % DIAG_GEN_SLOTS].from = diag_now();
++		return;
++	}
++
++	if (t && !READ_ONCE(t->wait_from)) {
++		t->preempted = false;
++		WRITE_ONCE(t->wait_from, diag_now());
++	}
++}
++
++static void diag_probe_irq_entry(void *data, int irq, struct irqaction *action)
++{
++	this_cpu_ptr(&diag_cpu)->irq_ts = diag_now();
++}
++
++static void diag_probe_irq_exit(void *data, int irq, struct irqaction *action,
++				int ret)
++{
++	struct diag_cpu *c = this_cpu_ptr(&diag_cpu);
++	u64 dt = diag_now() - c->irq_ts;
++	int cls = DIAG_I_OTHER;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(diag_irq_rx); i++)
++		if (diag_irq_rx[i] == irq)
++			cls = DIAG_I_RX;
++	for (i = 0; i < ARRAY_SIZE(diag_irq_tx); i++)
++		if (diag_irq_tx[i] == irq)
++			cls = DIAG_I_TX;
++
++	if (diag_on) {
++		c->irq_ns[cls] += dt;
++		c->irq_cnt[cls]++;
++	}
++	c->stolen += dt;
++	if (c->cur_vec >= 0)
++		c->sirq_stolen += dt;
++}
++
++static void diag_probe_softirq_entry(void *data, unsigned int vec)
++{
++	struct diag_cpu *c = this_cpu_ptr(&diag_cpu);
++
++	c->cur_vec = vec;
++	c->sirq_ts = diag_now();
++	c->sirq_stolen = 0;
++}
++
++static void diag_probe_softirq_exit(void *data, unsigned int vec)
++{
++	struct diag_cpu *c = this_cpu_ptr(&diag_cpu);
++	u64 dt;
++
++	if (c->cur_vec < 0 || vec >= NR_SOFTIRQS)
++		return;
++
++	dt = diag_now() - c->sirq_ts - c->sirq_stolen;
++	if (diag_on) {
++		c->sirq_ns[vec] += dt;
++		c->sirq_cnt[vec]++;
++		if (c->cur_class == DIAG_T_KSOFTIRQD)
++			c->sirq_ksoftirqd_ns[vec] += dt;
++	}
++	c->stolen += dt;
++	c->cur_vec = -1;
++}
++
++static void * const diag_probe[ARRAY_SIZE(diag_tp_name)] = {
++	diag_probe_switch, diag_probe_waking, diag_probe_irq_entry,
++	diag_probe_irq_exit, diag_probe_softirq_entry, diag_probe_softirq_exit,
++};
++
++static void diag_tp_find(struct tracepoint *tp, void *priv)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(diag_tp_name); i++)
++		if (!strcmp(tp->name, diag_tp_name[i]))
++			diag_tp[i] = tp;
++}
++
++/* An interrupt of @ring asked for its poll */
++void diag_irq(struct edma_ring *ring)
++{
++	if (!diag_on)
++		return;
++
++	ring->diag.irqs++;
++	WRITE_ONCE(ring->diag.irq_ts, diag_now());
++}
++
++/* Bottom halves are off around a poll, in a thread too */
++void diag_poll_begin(struct edma_ring *ring, bool tx)
++{
++	struct diag_ring *d = &ring->diag;
++	struct diag_poll *p = &d->cur;
++	struct diag_cpu *c;
++	u64 now, irq_ts;
++
++	if (!diag_on) {
++		p->start = 0;
++		return;
++	}
++
++	c = this_cpu_ptr(&diag_cpu);
++	now = diag_now();
++	memset(p, 0, sizeof(*p));
++	p->start = now;
++
++	irq_ts = READ_ONCE(d->irq_ts);
++	WRITE_ONCE(d->irq_ts, 0);
++	p->since_irq = irq_ts ? min_t(u64, now - irq_ts, U32_MAX - 1) : U32_MAX;
++	p->gap = d->last_end ? min_t(u64, now - d->last_end, U32_MAX) : U32_MAX;
++	p->cpu = smp_processor_id();
++	p->pid = current->pid;
++	if (tx) {
++		p->flags |= DIAG_POLL_TX;
++		p->after_loc = c->x_soft_loc - d->soft_loc_at_end;
++	}
++	if (in_hardirq()) {
++		p->flags |= DIAG_POLL_HARDIRQ;
++	} else if (in_serving_softirq()) {
++		p->flags |= DIAG_POLL_SOFTIRQ;
++		if (c->cur_class == DIAG_T_KSOFTIRQD)
++			p->flags |= DIAG_POLL_KSOFTIRQD;
++	}
++
++	d->cur_xmit_loc = c->x_loc;
++	d->cur_xmit_fwd = c->x_fwd;
++	d->cur_xmit_ns = c->x_ns_all;
++	d->saved_in_poll = c->in_poll;
++	c->in_poll = tx ? 2 : 1;
++}
++
++void diag_poll_end(struct edma_ring *ring, int done, int budget, u16 q_out)
++{
++	struct diag_ring *d = &ring->diag;
++	struct diag_poll *p = &d->cur;
++	struct diag_cpu *c;
++	u64 now;
++
++	if (!p->start)
++		return;
++
++	c = this_cpu_ptr(&diag_cpu);
++	c->in_poll = d->saved_in_poll;
++	d->soft_loc_at_end = c->x_soft_loc;
++	now = diag_now();
++
++	p->dur = now - p->start;
++	p->n = done;
++	p->q_out = q_out;
++	if (done >= budget)
++		p->flags |= DIAG_POLL_BUDGET;
++	p->xmit_loc = c->x_loc - d->cur_xmit_loc;
++	p->xmit_fwd = c->x_fwd - d->cur_xmit_fwd;
++	p->xmit_ns = c->x_ns_all - d->cur_xmit_ns;
++	d->last_end = now;
++
++	d->dur += p->dur;
++	d->n += p->n;
++	d->frames += p->frames;
++	d->fwd += p->fwd;
++	d->loc += p->loc;
++	d->ack += p->ack;
++	d->scan += p->scan;
++	d->xmit_loc += p->xmit_loc;
++	d->xmit_fwd += p->xmit_fwd;
++	d->xmit_ns += p->xmit_ns;
++	d->woken += p->woken;
++	if (p->flags & DIAG_POLL_BUDGET)
++		d->budget++;
++	if (p->since_irq != U32_MAX) {
++		d->from_irq++;
++		diag_hist_add(d->hist_since_irq, p->since_irq);
++	} else if (p->gap != U32_MAX) {
++		diag_hist_add(d->hist_gap, p->gap);
++	}
++	diag_hist_add(d->hist_n, p->n);
++	diag_hist_add(d->hist_q, p->q_in);
++
++	if (d->rec)
++		d->rec[d->polls % diag_cap] = *p;
++	d->polls++;
++	p->start = 0;
++}
++
++/* The first buffer of a frame, from the Ethernet header on. Says whether the
++ * frame is to be dropped.
++ */
++bool diag_rx_frame(struct edma_ring *ring, const void *frame, unsigned int len)
++{
++	struct diag_poll *p = &ring->diag.cur;
++	const struct ethhdr *eth = frame;
++	const struct iphdr *ip = frame + ETH_HLEN;
++	const struct udphdr *udp;
++	const struct tcphdr *tcp;
++	unsigned int port, i;
++
++	p->frames++;
++
++	if (len < ETH_HLEN + sizeof(*ip) + sizeof(*tcp) ||
++	    eth->h_proto != htons(ETH_P_IP))
++		return false;
++
++	if (ip->protocol == IPPROTO_UDP) {
++		udp = (void *)ip + ip->ihl * 4;
++		port = ntohs(udp->dest);
++
++		if (port == DIAG_MARK_PORT) {
++			i = (unsigned int)atomic_inc_return(&diag_mark_n) - 1;
++			diag_mark[i % DIAG_MARKS].seq =
++				get_unaligned_be32(udp + 1);
++			diag_mark[i % DIAG_MARKS].at = diag_now();
++		}
++
++		if (exp_rx_drop_port && port >= exp_rx_drop_port &&
++		    port < exp_rx_drop_port + 100) {
++			if (diag_on)
++				ring->diag.dropped++;
++			return true;
++		}
++	}
++
++	tcp = (void *)ip + ip->ihl * 4;
++
++	/* The addresses of the router in the experiment all end in .1 */
++	if ((ntohl(ip->daddr) & 0xff) != 1 ||
++	    ((ip->protocol == IPPROTO_UDP || ip->protocol == IPPROTO_TCP) &&
++	     (ntohs(tcp->source) == diag_fwd_port ||
++	      ntohs(tcp->dest) == diag_fwd_port))) {
++		p->fwd++;
++		return false;
++	}
++
++	if (ip->protocol == IPPROTO_TCP &&
++	    ntohs(ip->tot_len) == ip->ihl * 4 + tcp->doff * 4)
++		p->ack++;
++	else
++		p->loc++;
++
++	return false;
++}
++
++/* Called with bottom halves off, like the xmit itself */
++void diag_xmit_begin(struct sk_buff *skb, u64 *start, bool *local)
++{
++	*start = 0;
++	*local = skb->sk;
++	if (!diag_on)
++		return;
++
++	if (skb_is_nonlinear(skb))
++		this_cpu_ptr(&diag_cpu)->x_nonlinear++;
++	if (diag_xmit_time)
++		*start = diag_now();
++}
++
++void diag_xmit_end(u64 start, bool local, unsigned int len, bool busy)
++{
++	struct diag_cpu *c;
++	int ctx;
++	u64 dt;
++
++	if (!diag_on)
++		return;
++
++	c = this_cpu_ptr(&diag_cpu);
++	if (c->in_poll)
++		ctx = c->in_poll == 1 ? DIAG_X_RXPOLL : DIAG_X_TXPOLL;
++	else if (c->cur_vec == NET_TX_SOFTIRQ)
++		ctx = DIAG_X_NET_TX;
++	else if (c->cur_vec == TASKLET_SOFTIRQ)
++		ctx = DIAG_X_TASKLET;
++	else if (c->cur_vec == TIMER_SOFTIRQ || c->cur_vec == HRTIMER_SOFTIRQ)
++		ctx = DIAG_X_TIMER;
++	else if (c->cur_vec >= 0)
++		ctx = DIAG_X_SOFTIRQ;
++	else
++		ctx = c->cur_class == DIAG_T_GEN ? DIAG_X_GEN : DIAG_X_PROC;
++
++	if (busy) {
++		c->x_busy++;
++	} else {
++		c->x_pkts[ctx][local]++;
++		c->x_bytes[ctx][local] += len;
++		if (local)
++			c->x_loc++;
++		else
++			c->x_fwd++;
++		if (local && ctx >= DIAG_X_NET_TX && ctx <= DIAG_X_SOFTIRQ)
++			c->x_soft_loc++;
++	}
++
++	if (start) {
++		dt = diag_now() - start;
++		c->x_ns[ctx] += dt;
++		c->x_ns_all += dt;
++	}
++}
++
++/* The driver's poll that only hands frames to the stack (exp_rx_hardirq) */
++void diag_in_poll(u8 kind)
++{
++	this_cpu_ptr(&diag_cpu)->in_poll = kind;
++}
++
++/* What the sampler reads of TX queue @i: bytes the stack has handed over
++ * that are not reported as sent, the limit on those, packets and bytes that
++ * wait in the queue's qdisc
++ */
++static void diag_txq_sample(unsigned int i, u32 *val)
++{
++	struct netdev_queue *txq = netdev_get_tx_queue(diag_txq[i].port->netdev,
++						       diag_txq[i].queue);
++	struct Qdisc *qdisc = rcu_dereference_raw(txq->qdisc);
++
++	val[0] = txq->dql.num_queued - txq->dql.num_completed;
++	val[1] = txq->dql.limit;
++	val[2] = qdisc ? qdisc->q.qlen : 0;
++	val[3] = qdisc ? qdisc->qstats.backlog : 0;
++}
++
++/* The totals of every TX queue: packets put into its ring, how often it was
++ * stopped, woken by the completion poll, woken again by the sending side,
++ * and what its qdisc dropped and took back
++ */
++static void diag_txq_totals(u64 (*val)[DIAG_TXQ_TOTALS])
++{
++	unsigned int i;
++
++	for (i = 0; i < diag_ntxq; i++) {
++		struct ppe_port *port = diag_txq[i].port;
++		u8 q = diag_txq[i].queue;
++		struct Qdisc *qdisc = rcu_dereference_raw(netdev_get_tx_queue(port->netdev, q)->qdisc);
++
++		val[i][0] = port->tx_ring_packets[q];
++		val[i][1] = port->tx_ring_stopped[q];
++		val[i][2] = port->tx_ring_woken[q];
++		val[i][3] = port->tx_ring_rewoken[q];
++		val[i][4] = qdisc ? qdisc->qstats.drops : 0;
++		val[i][5] = qdisc ? qdisc->qstats.requeues : 0;
++	}
++}
++
++static enum hrtimer_restart diag_sample_fn(struct hrtimer *timer)
++{
++	u64 t0 = diag_now();
++	unsigned int i;
++	u32 *r;
++
++	if (diag.n >= diag.cap) {
++		diag.running = false;
++		return HRTIMER_NORESTART;
++	}
++
++	r = diag.buf + diag.n * diag.rec_words;
++	r[0] = t0;
++	r[1] = t0 >> 32;
++	for (i = 0; i < diag.rec_regs; i++)
++		r[3 + i] = readl(diag.base + diag.regs[i]);
++	for (i = 0; i < diag_ntxq; i++)
++		diag_txq_sample(i, r + 3 + diag.rec_regs + DIAG_TXQ_SAMPLE * i);
++	r[2] = diag_now() - t0;
++	diag.sample_ns += r[2];
++	diag.n++;
++
++	hrtimer_forward_now(timer, diag.period);
++
++	return HRTIMER_RESTART;
++}
++
++static void diag_sample_start(void *unused)
++{
++	hrtimer_start(&diag.timer, diag.period, HRTIMER_MODE_REL_PINNED_HARD);
++}
++
++static int diag_watch_fn(void *unused)
++{
++	u64 end = diag_now() + (u64)diag.wms * NSEC_PER_MSEC;
++	u32 last[DIAG_WREGS_MAX];
++	u64 loops = 0;
++	u64 now;
++	unsigned int i;
++	u32 val;
++
++	for (i = 0; i < diag.nwregs; i++)
++		last[i] = ~readl(diag.base + diag.wregs[i]);
++
++	do {
++		now = diag_now();
++		for (i = 0; i < diag.nwregs; i++) {
++			val = readl(diag.base + diag.wregs[i]);
++			if (val == last[i] || diag.wn >= diag.wcap)
++				continue;
++
++			last[i] = val;
++			diag.wbuf[2 * diag.wn] = now;
++			diag.wbuf[2 * diag.wn + 1] = (u64)i << 32 | val;
++			diag.wn++;
++		}
++		loops++;
++	} while (now < end);
++
++	diag.wloops = loops;
++	diag.wdone = true;
++	diag.watcher = NULL;
++
++	return 0;
++}
++
++static void diag_reset_cpu(void *unused)
++{
++	struct diag_cpu *c = this_cpu_ptr(&diag_cpu);
++	u64 now = diag_now();
++
++	memset(c->irq_ns, 0, sizeof(c->irq_ns));
++	memset(c->irq_cnt, 0, sizeof(c->irq_cnt));
++	memset(c->sirq_ns, 0, sizeof(c->sirq_ns));
++	memset(c->sirq_cnt, 0, sizeof(c->sirq_cnt));
++	memset(c->sirq_ksoftirqd_ns, 0, sizeof(c->sirq_ksoftirqd_ns));
++	memset(c->task_ns, 0, sizeof(c->task_ns));
++	memset(c->task_sw, 0, sizeof(c->task_sw));
++	memset(c->x_pkts, 0, sizeof(c->x_pkts));
++	memset(c->x_bytes, 0, sizeof(c->x_bytes));
++	memset(c->x_ns, 0, sizeof(c->x_ns));
++	c->x_busy = 0;
++	c->x_nonlinear = 0;
++	c->gen_wait_ns = 0;
++	c->gen_wait_cnt = 0;
++	c->gen_wait_max = 0;
++	memset(c->hist_gen_wait, 0, sizeof(c->hist_gen_wait));
++	c->since = now;
++	c->switch_ts = now;
++	c->stolen = 0;
++	c->sirq_ts = now;
++	c->sirq_stolen = 0;
++	c->cur_class = diag_task_class(current);
++}
++
++static void diag_reset_ring(struct edma_ring *ring)
++{
++	struct diag_ring *d = &ring->diag;
++	struct diag_poll *rec = d->rec;
++
++	/* The records themselves are left as they are: clearing them takes
++	 * long enough for an RX ring to fill up meanwhile. Each carries when
++	 * its poll began, which tells the old ones from the new.
++	 */
++	memset(d, 0, offsetof(struct diag_ring, cur));
++	d->rec = rec;
++}
++
++/* The polls go on meanwhile: a count may be off by what one poll adds */
++static void diag_reset(void)
++{
++	struct edma *edma = &diag.ppe_dev->edma;
++	struct diag_thread *t;
++	int i;
++
++	for (i = 0; i < edma->num_rx; i++)
++		diag_reset_ring(&edma->rxdesc[i]);
++	for (i = 0; i < edma->num_txcmpl; i++)
++		diag_reset_ring(&edma->txcmpl[i]);
++
++	for (i = 0; i < DIAG_THREADS; i++) {
++		t = &diag_thread[i];
++		t->wake_ns = 0;
++		t->wake_cnt = 0;
++		t->wake_max = 0;
++		t->pre_ns = 0;
++		t->pre_cnt = 0;
++		t->pre_max = 0;
++		memset(t->hist_wake, 0, sizeof(t->hist_wake));
++		memset(t->hist_pre, 0, sizeof(t->hist_pre));
++	}
++
++	diag_txq_totals(diag_txq_base);
++	memset(diag_txq_end, 0, sizeof(diag_txq_end));
++	on_each_cpu(diag_reset_cpu, NULL, 1);
++}
++
++static enum hrtimer_restart diag_window_fn(struct hrtimer *timer)
++{
++	WRITE_ONCE(diag_on, false);
++	diag.win_stop = diag_now();
++	diag_txq_totals(diag_txq_end);
++
++	return HRTIMER_NORESTART;
++}
++
++/* Keep every CPU busy with interrupts off for a while: what a kernel that
++ * hangs looks like to the watchdog, but it ends by itself
++ */
++static void diag_stall_cpu(void *arg)
++{
++	unsigned int sec = *(unsigned int *)arg;
++
++	while (sec--)
++		mdelay(1000);
++}
++
++static void diag_set_prio(struct diag_thread *t, int prio)
++{
++	if (!t->task)
++		return;
++
++	if (prio == 100)
++		sched_set_fifo_low(t->task);
++	else if (prio == 101)
++		sched_set_fifo(t->task);
++	else
++		sched_set_normal(t->task, clamp(prio, -20, 19));
++}
++
++/* What can be written to ctl, one command a write:
++ * reset
++ * run <ms>			reset, record for that long, then stop
++ * stall <seconds>		all CPUs busy with interrupts off for that long
++ * regs <offset>...		the registers the sampler reads; regs+ adds more
++ * sample <us> <cpu> <count>	start the sampler; "sample 0" stops it
++ * wregs <offset>...		the registers the watcher reads, at most 8
++ * watch <cpu> <ms> <count>	watch for that long, keep that many changes
++ * ictl rx|tx <n>		write the interrupt control registers of the host's
++ *				RX rings or TX completion rings
++ * mod rx|tx <n>		write the moderation timers of the host's RX rings
++ *				or TX completion rings
++ * prio rx|tx <n>		the NAPI threads: nice -20 to 19, 100 for the
++ *				lowest real-time priority, 101 for a middle one
++ */
++static ssize_t diag_ctl_write(struct file *file, const char __user *ubuf,
++			      size_t len, loff_t *ppos)
++{
++	unsigned int us, cpu, count, ms, n;
++	char buf[768];
++	char *s, *tok;
++	int prio, i;
++	u32 *regs;
++	u32 reg;
++
++	if (len >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, len))
++		return -EFAULT;
++	buf[len] = 0;
++	s = strim(buf);
++
++	if (!strcmp(s, "reset")) {
++		diag_reset();
++		return len;
++	}
++
++	if (sscanf(s, "run %u", &ms) == 1) {
++		if (!ms || ms > 600000)
++			return -EINVAL;
++
++		hrtimer_cancel(&diag.window);
++		WRITE_ONCE(diag_on, false);
++		diag_reset();
++		diag.win_stop = 0;
++		diag.win_start = diag_now();
++		WRITE_ONCE(diag_on, true);
++		hrtimer_start(&diag.window, ms_to_ktime(ms), HRTIMER_MODE_REL);
++		return len;
++	}
++
++	if (sscanf(s, "stall %u", &count) == 1) {
++		static unsigned int stall_sec;
++
++		if (!count || count > 180)
++			return -EINVAL;
++
++		stall_sec = count;
++		on_each_cpu(diag_stall_cpu, &stall_sec, 0);
++		return len;
++	}
++
++	if (!strncmp(s, "regs", 4) || !strncmp(s, "wregs", 5)) {
++		bool watch = s[0] == 'w';
++
++		if (watch ? !!diag.watcher : diag.running)
++			return -EBUSY;
++
++		regs = watch ? diag.wregs : diag.regs;
++		/* "regs+" adds to the list */
++		n = !watch && s[4] == '+' ? diag.nregs : 0;
++		strsep(&s, " ");
++		while ((tok = strsep(&s, " ")) != NULL) {
++			if (!*tok)
++				continue;
++			if (n >= (watch ? DIAG_WREGS_MAX : DIAG_REGS_MAX) ||
++			    kstrtou32(tok, 16, &reg) || reg & 3 ||
++			    reg >= 0xbb0000)
++				return -EINVAL;
++			regs[n++] = reg;
++		}
++		if (watch)
++			diag.nwregs = n;
++		else
++			diag.nregs = n;
++		return len;
++	}
++
++	if (sscanf(s, "sample %u %u %u", &us, &cpu, &count) >= 1) {
++		hrtimer_cancel(&diag.timer);
++		diag.running = false;
++		if (!us)
++			return len;
++		if (sscanf(s, "sample %u %u %u", &us, &cpu, &count) != 3 ||
++		    !cpu_online(cpu) || !count || !diag.nregs)
++			return -EINVAL;
++
++		/* A buffer that is big enough is used again, as it is: getting
++		 * and clearing a new one stalls the CPU this runs on
++		 */
++		diag.rec_regs = diag.nregs;
++		diag.rec_words = 3 + diag.rec_regs + DIAG_TXQ_SAMPLE * diag_ntxq;
++		if ((size_t)count * diag.rec_words > diag.buf_words) {
++			vfree(diag.buf);
++			diag.buf_words = 0;
++			diag.blob.size = 0;
++			diag.buf = vmalloc(array3_size(count, diag.rec_words,
++						       sizeof(u32)));
++			if (!diag.buf)
++				return -ENOMEM;
++			diag.buf_words = (size_t)count * diag.rec_words;
++		}
++		diag.cap = count;
++		diag.n = 0;
++		diag.sample_ns = 0;
++		diag.blob.data = diag.buf;
++		diag.blob.size = (size_t)count * diag.rec_words * sizeof(u32);
++		diag.period = ns_to_ktime((u64)us * NSEC_PER_USEC);
++		diag.running = true;
++		smp_call_function_single(cpu, diag_sample_start, NULL, 1);
++		return len;
++	}
++
++	if (sscanf(s, "watch %u %u %u", &cpu, &ms, &count) == 3) {
++		if (diag.watcher || !cpu_online(cpu) || !count ||
++		    !diag.nwregs || ms > 5000)
++			return -EINVAL;
++
++		if (count > diag.wbuf_cap) {
++			vfree(diag.wbuf);
++			diag.wbuf_cap = 0;
++			diag.wblob.size = 0;
++			diag.wbuf = vmalloc(array3_size(count, 2, sizeof(u64)));
++			if (!diag.wbuf)
++				return -ENOMEM;
++			diag.wbuf_cap = count;
++		}
++		diag.wcap = count;
++		diag.wn = 0;
++		diag.wms = ms;
++		diag.wdone = false;
++		diag.wblob.data = diag.wbuf;
++		diag.wblob.size = (size_t)count * 2 * sizeof(u64);
++		diag.watcher = kthread_run_on_cpu(diag_watch_fn, NULL, cpu,
++						  "diag_watch");
++		if (IS_ERR(diag.watcher)) {
++			diag.watcher = NULL;
++			return -ENOMEM;
++		}
++		return len;
++	}
++
++	if (sscanf(s, "ictl rx %u", &count) == 1) {
++		struct edma *edma = &diag.ppe_dev->edma;
++
++		for (i = 0; i < edma->num_rx; i++)
++			writel(count, diag.base + EDMA_BASE_OFFSET +
++			       EDMA_REG_RX_INT_CTRL(edma->rxdesc[i].id));
++		return len;
++	}
++
++	if (sscanf(s, "ictl tx %u", &count) == 1) {
++		struct edma *edma = &diag.ppe_dev->edma;
++		u32 base = diag.ppe_dev->soc->edma_tx_int_base;
++
++		for (i = 0; i < edma->num_txcmpl; i++)
++			writel(count, diag.base + EDMA_BASE_OFFSET +
++			       EDMA_REG_TX_INT_CTRL(base, edma->txcmpl[i].id));
++		return len;
++	}
++
++	if (sscanf(s, "mod rx %u", &count) == 1) {
++		struct edma *edma = &diag.ppe_dev->edma;
++
++		for (i = 0; i < edma->num_rx; i++)
++			writel(count, diag.base + EDMA_BASE_OFFSET +
++			       EDMA_REG_RX_MOD_TIMER(edma->rxdesc[i].id));
++		return len;
++	}
++
++	if (sscanf(s, "mod tx %u", &count) == 1) {
++		struct edma *edma = &diag.ppe_dev->edma;
++		u32 base = diag.ppe_dev->soc->edma_tx_int_base;
++
++		for (i = 0; i < edma->num_txcmpl; i++)
++			writel(count, diag.base + EDMA_BASE_OFFSET +
++			       EDMA_REG_TX_MOD_TIMER(base, edma->txcmpl[i].id));
++		return len;
++	}
++
++	if (sscanf(s, "prio rx %d", &prio) == 1) {
++		for (i = 0; i < EDMA_MAX_RX_GROUPS; i++)
++			diag_set_prio(&diag_thread[i], prio);
++		return len;
++	}
++
++	if (sscanf(s, "prio tx %d", &prio) == 1) {
++		for (i = EDMA_MAX_RX_GROUPS; i < DIAG_THREADS; i++)
++			diag_set_prio(&diag_thread[i], prio);
++		return len;
++	}
++
++	return -EINVAL;
++}
++
++static const struct file_operations diag_ctl_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = diag_ctl_write,
++};
++
++static void diag_show_u64s(struct seq_file *m, const char *name,
++			   const u64 *val, int n)
++{
++	int i;
++
++	seq_puts(m, name);
++	for (i = 0; i < n; i++)
++		seq_printf(m, " %llu", val[i]);
++	seq_putc(m, '\n');
++}
++
++static void diag_show_ring(struct seq_file *m, const char *kind, int idx,
++			   struct edma_ring *ring)
++{
++	struct diag_ring *d = &ring->diag;
++	char name[32];
++
++	seq_printf(m, "ring %s%d id=%u irq=%d polls=%llu dur=%llu n=%llu frames=%llu fwd=%llu loc=%llu ack=%llu scan=%llu scans=%llu dropped=%llu xmit_loc=%llu xmit_fwd=%llu xmit_ns=%llu woken=%llu budget=%llu from_irq=%llu irqs=%llu count=%u swq_done=%llu swq_drop=%llu leaked=%llu\n",
++		   kind, idx, ring->id, ring->irq, d->polls, d->dur, d->n,
++		   d->frames, d->fwd, d->loc, d->ack, d->scan, d->scans,
++		   d->dropped, d->xmit_loc, d->xmit_fwd, d->xmit_ns, d->woken,
++		   d->budget, d->from_irq, d->irqs, ring->count, d->swq_done,
++		   d->swq_drop, d->leaked);
++
++	snprintf(name, sizeof(name), "hist %s%d since_irq", kind, idx);
++	diag_show_u64s(m, name, d->hist_since_irq, DIAG_HIST);
++	snprintf(name, sizeof(name), "hist %s%d gap", kind, idx);
++	diag_show_u64s(m, name, d->hist_gap, DIAG_HIST);
++	snprintf(name, sizeof(name), "hist %s%d n", kind, idx);
++	diag_show_u64s(m, name, d->hist_n, DIAG_HIST);
++	snprintf(name, sizeof(name), "hist %s%d q", kind, idx);
++	diag_show_u64s(m, name, d->hist_q, DIAG_HIST);
++}
++
++static int diag_summary_show(struct seq_file *m, void *unused)
++{
++	struct ppe_device *ppe_dev = diag.ppe_dev;
++	struct edma *edma = &ppe_dev->edma;
++	struct diag_thread *t;
++	struct diag_cpu *c;
++	char name[40];
++	int cpu, i;
++
++	seq_printf(m, "now %llu\n", diag_now());
++	seq_printf(m, "window start=%llu stop=%llu\n", diag.win_start,
++		   diag.win_stop);
++	seq_printf(m, "config diag_on=%d probes=%d poll_size=%zu diag_cap=%u num_rx=%u num_txcmpl=%u rx_buffer_size=%u\n",
++		   diag_on, diag.probes, sizeof(struct diag_poll), diag_cap,
++		   edma->num_rx, edma->num_txcmpl, edma->rx_buffer_size);
++
++	for (i = 0; i < edma->num_rx; i++)
++		diag_show_ring(m, "rx", i, &edma->rxdesc[i]);
++	for (i = 0; i < edma->num_txcmpl; i++)
++		diag_show_ring(m, "tx", i, &edma->txcmpl[i]);
++
++	for (i = 0; i < ARRAY_SIZE(ppe_dev->ports); i++) {
++		struct ppe_port *port = ppe_dev->ports[i];
++
++		if (!port)
++			continue;
++
++		seq_printf(m, "port %d name=%s num_txq=%u tx_ring_base=%u tx_cmpl_base=%u\n",
++			   i, port->netdev->name, port->num_txq,
++			   port->tx_ring_base, port->tx_cmpl_base);
++	}
++
++	for_each_online_cpu(cpu) {
++		c = per_cpu_ptr(&diag_cpu, cpu);
++
++		seq_printf(m, "cpu %d since=%llu\n", cpu, c->since);
++		snprintf(name, sizeof(name), "cpu %d irq_ns", cpu);
++		diag_show_u64s(m, name, c->irq_ns, DIAG_I_NUM);
++		snprintf(name, sizeof(name), "cpu %d irq_cnt", cpu);
++		diag_show_u64s(m, name, c->irq_cnt, DIAG_I_NUM);
++		snprintf(name, sizeof(name), "cpu %d sirq_ns", cpu);
++		diag_show_u64s(m, name, c->sirq_ns, NR_SOFTIRQS);
++		snprintf(name, sizeof(name), "cpu %d sirq_cnt", cpu);
++		diag_show_u64s(m, name, c->sirq_cnt, NR_SOFTIRQS);
++		snprintf(name, sizeof(name), "cpu %d sirq_ksoftirqd_ns", cpu);
++		diag_show_u64s(m, name, c->sirq_ksoftirqd_ns, NR_SOFTIRQS);
++		snprintf(name, sizeof(name), "cpu %d task_ns", cpu);
++		diag_show_u64s(m, name, c->task_ns, DIAG_T_NUM);
++		snprintf(name, sizeof(name), "cpu %d task_sw", cpu);
++		diag_show_u64s(m, name, c->task_sw, DIAG_T_NUM);
++		for (i = 0; i < DIAG_X_NUM; i++)
++			seq_printf(m, "cpu %d xmit %s loc=%llu fwd=%llu loc_bytes=%llu fwd_bytes=%llu ns=%llu\n",
++				   cpu, diag_xmit_name[i], c->x_pkts[i][1],
++				   c->x_pkts[i][0], c->x_bytes[i][1],
++				   c->x_bytes[i][0], c->x_ns[i]);
++		seq_printf(m, "cpu %d xmit_busy=%llu xmit_nonlinear=%llu gen_wait_ns=%llu gen_wait_cnt=%llu gen_wait_max=%llu\n",
++			   cpu, c->x_busy, c->x_nonlinear, c->gen_wait_ns,
++			   c->gen_wait_cnt, c->gen_wait_max);
++		snprintf(name, sizeof(name), "cpu %d hist_gen_wait", cpu);
++		diag_show_u64s(m, name, c->hist_gen_wait, DIAG_HIST);
++	}
++
++	seq_puts(m, "task_classes");
++	for (i = 0; i < DIAG_T_NUM; i++)
++		seq_printf(m, " %s", diag_task_name[i]);
++	seq_putc(m, '\n');
++
++	for (i = 0; i < DIAG_THREADS; i++) {
++		t = &diag_thread[i];
++		if (!t->task)
++			continue;
++
++		seq_printf(m, "thread %s%d pid=%d cpu=%u policy=%u nice=%d wake_ns=%llu wake_cnt=%llu wake_max=%llu pre_ns=%llu pre_cnt=%llu pre_max=%llu\n",
++			   i < EDMA_MAX_RX_GROUPS ? "rx" : "tx",
++			   i % EDMA_MAX_RX_GROUPS, t->task->pid,
++			   task_cpu(t->task), t->task->policy,
++			   task_nice(t->task), t->wake_ns, t->wake_cnt,
++			   t->wake_max, t->pre_ns, t->pre_cnt, t->pre_max);
++		snprintf(name, sizeof(name), "hist thread%d wake", i);
++		diag_show_u64s(m, name, t->hist_wake, DIAG_HIST);
++		snprintf(name, sizeof(name), "hist thread%d pre", i);
++		diag_show_u64s(m, name, t->hist_pre, DIAG_HIST);
++	}
++
++	/* The totals over the window if it has ended, else since it began */
++	if (!diag.win_stop)
++		diag_txq_totals(diag_txq_end);
++	for (i = 0; i < diag_ntxq; i++) {
++		u32 now_val[DIAG_TXQ_SAMPLE];
++
++		diag_txq_sample(i, now_val);
++		seq_printf(m, "txq %s-%u packets=%llu stopped=%llu woken=%llu rewoken=%llu qdisc_drops=%llu qdisc_requeues=%llu inflight=%u limit=%u qlen=%u backlog=%u\n",
++			   diag_txq[i].port->netdev->name, diag_txq[i].queue,
++			   diag_txq_end[i][0] - diag_txq_base[i][0],
++			   diag_txq_end[i][1] - diag_txq_base[i][1],
++			   diag_txq_end[i][2] - diag_txq_base[i][2],
++			   diag_txq_end[i][3] - diag_txq_base[i][3],
++			   diag_txq_end[i][4] - diag_txq_base[i][4],
++			   diag_txq_end[i][5] - diag_txq_base[i][5],
++			   now_val[0], now_val[1], now_val[2], now_val[3]);
++	}
++
++	for (i = 0; i < DIAG_MARKS; i++)
++		if (diag_mark[i].at)
++			seq_printf(m, "mark %u %llu\n", diag_mark[i].seq,
++				   diag_mark[i].at);
++
++	seq_printf(m, "sampler running=%d n=%u cap=%u regs=%u words=%u ns=%llu txqs=%u\n",
++		   diag.running, diag.n, diag.cap, diag.rec_regs,
++		   diag.rec_words, diag.sample_ns, diag_ntxq);
++	seq_printf(m, "watcher done=%d n=%u cap=%u regs=%u loops=%llu ms=%u\n",
++		   diag.wdone, diag.wn, diag.wcap, diag.nwregs, diag.wloops,
++		   diag.wms);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(diag_summary);
++
++/* The NAPI threads and the interrupts exist by now */
++void ppe_diag_threads(struct ppe_device *ppe_dev)
++{
++	struct edma *edma = &ppe_dev->edma;
++	int i;
++
++	for (i = 0; i < edma->num_rx; i++) {
++		diag_thread[i].task = edma->rxdesc[i].napi.thread;
++		diag_irq_rx[2 * i] = edma->rxdesc[i].irq;
++		diag_irq_rx[2 * i + 1] = edma->rxfill[i].irq;
++	}
++
++	for (i = 0; i < edma->num_txcmpl; i++) {
++		diag_thread[EDMA_MAX_RX_GROUPS + i].task =
++			exp_combined ? NULL : edma->txcmpl[i].napi.thread;
++		diag_irq_tx[i] = edma->txcmpl[i].irq;
++	}
++}
++
++int ppe_diag_init(struct ppe_device *ppe_dev, void __iomem *base)
++{
++	struct edma *edma = &ppe_dev->edma;
++	char name[16];
++	int i, ret;
++
++	diag.ppe_dev = ppe_dev;
++	diag.base = base;
++	hrtimer_setup(&diag.timer, diag_sample_fn, CLOCK_MONOTONIC,
++		      HRTIMER_MODE_REL_PINNED_HARD);
++	hrtimer_setup(&diag.window, diag_window_fn, CLOCK_MONOTONIC,
++		      HRTIMER_MODE_REL);
++
++	diag.dir = debugfs_create_dir("ipq807x_diag", NULL);
++	debugfs_create_file("summary", 0444, diag.dir, NULL,
++			    &diag_summary_fops);
++	debugfs_create_file("ctl", 0200, diag.dir, NULL, &diag_ctl_fops);
++	debugfs_create_blob("samples", 0444, diag.dir, &diag.blob);
++	debugfs_create_blob("watch", 0444, diag.dir, &diag.wblob);
++
++	for (i = 0; i < edma->num_rx + edma->num_txcmpl; i++) {
++		bool tx = i >= edma->num_rx;
++		struct edma_ring *ring = tx ? &edma->txcmpl[i - edma->num_rx] :
++					      &edma->rxdesc[i];
++
++		ring->diag.rec = vzalloc(array_size(diag_cap,
++						    sizeof(struct diag_poll)));
++		if (!ring->diag.rec)
++			continue;
++
++		diag.ring_blob[i].data = ring->diag.rec;
++		diag.ring_blob[i].size = (size_t)diag_cap *
++					 sizeof(struct diag_poll);
++		snprintf(name, sizeof(name), "%s%d", tx ? "tx" : "rx",
++			 tx ? i - edma->num_rx : i);
++		debugfs_create_blob(name, 0444, diag.dir, &diag.ring_blob[i]);
++	}
++
++	diag_ntxq = 0;
++	for (i = 0; i < ARRAY_SIZE(ppe_dev->ports); i++) {
++		struct ppe_port *port = ppe_dev->ports[i];
++		int q;
++
++		for (q = 0; port && q < port->num_txq && diag_ntxq < DIAG_TXQS; q++) {
++			diag_txq[diag_ntxq].port = port;
++			diag_txq[diag_ntxq++].queue = q;
++		}
++	}
++
++	on_each_cpu(diag_reset_cpu, NULL, 1);
++	for_each_possible_cpu(i)
++		per_cpu_ptr(&diag_cpu, i)->cur_vec = -1;
++
++	for_each_kernel_tracepoint(diag_tp_find, NULL);
++	for (i = 0; i < ARRAY_SIZE(diag_tp); i++)
++		if (!diag_tp[i])
++			return 0;
++
++	for (i = 0; i < ARRAY_SIZE(diag_tp); i++) {
++		ret = tracepoint_probe_register(diag_tp[i], diag_probe[i], NULL);
++		if (ret) {
++			while (i--)
++				tracepoint_probe_unregister(diag_tp[i],
++							    diag_probe[i], NULL);
++			return 0;
++		}
++	}
++	diag.probes = true;
++
++	return 0;
++}
++
++/* Before the netdevs go: nothing reads a TX queue or records from here on */
++void ppe_diag_quiesce(void)
++{
++	hrtimer_cancel(&diag.window);
++	WRITE_ONCE(diag_on, false);
++	hrtimer_cancel(&diag.timer);
++	diag.running = false;
++	diag_ntxq = 0;
++}
++
++void ppe_diag_exit(struct ppe_device *ppe_dev)
++{
++	struct edma *edma = &ppe_dev->edma;
++	int i;
++
++	hrtimer_cancel(&diag.window);
++	diag_on = false;
++	hrtimer_cancel(&diag.timer);
++	while (diag.watcher)
++		msleep(20);
++
++	if (diag.probes) {
++		for (i = 0; i < ARRAY_SIZE(diag_tp); i++)
++			tracepoint_probe_unregister(diag_tp[i], diag_probe[i],
++						    NULL);
++		tracepoint_synchronize_unregister();
++		diag.probes = false;
++	}
++
++	debugfs_remove_recursive(diag.dir);
++	vfree(diag.buf);
++	vfree(diag.wbuf);
++	diag.buf = NULL;
++	diag.wbuf = NULL;
++
++	for (i = 0; i < edma->num_rx; i++) {
++		vfree(edma->rxdesc[i].diag.rec);
++		edma->rxdesc[i].diag.rec = NULL;
++	}
++	for (i = 0; i < edma->num_txcmpl; i++) {
++		vfree(edma->txcmpl[i].diag.rec);
++		edma->txcmpl[i].diag.rec = NULL;
++	}
++	memset(diag_thread, 0, sizeof(diag_thread));
++}
+diff -u -r -N a/ipq807x/ppe_diag.h b/ipq807x/ppe_diag.h
+--- a/ipq807x/ppe_diag.h	1969-12-31 16:00:00.000000000 -0800
++++ b/ipq807x/ppe_diag.h	2026-11-27 13:52:59.526427015 -0700
+@@ -0,0 +1,158 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * E-0007 experiment only: what the driver records about itself and what can
++ * be switched to something else than the driver does. See ppe_diag.c.
++ */
++
++#ifndef __IPQ807X_PPE_DIAG_H
++#define __IPQ807X_PPE_DIAG_H
++
++#include <linux/io.h>
++#include <linux/regmap.h>
++#include <linux/timekeeping.h>
++
++struct ppe_device;
++struct edma_ring;
++struct sk_buff;
++
++/* Given when the module is loaded */
++extern unsigned int exp_no_fc;
++extern unsigned int exp_tx_thread;
++extern unsigned int exp_rx_softirq;
++extern unsigned int exp_combined;
++extern unsigned int exp_rx_weight;
++extern unsigned int exp_tx_weight;
++extern unsigned int exp_cmpl_shift;
++extern unsigned int exp_rx_mod;
++extern unsigned int exp_tx_mod;
++extern unsigned int exp_rx_ring;
++extern unsigned int exp_tx_ring;
++extern unsigned int exp_txcmpl_ring;
++extern unsigned int exp_bm_react;
++extern unsigned int exp_bm_ceiling;
++extern unsigned int exp_bm_weight;
++extern unsigned int exp_bm_group;
++extern unsigned int exp_bm_resume;
++extern unsigned int exp_raw_io;
++extern unsigned int exp_page_idx;
++extern unsigned int exp_sync_len;
++extern unsigned int exp_rx_hardirq;
++extern unsigned int exp_defer_irqs;
++extern unsigned int exp_gro_flush_us;
++extern unsigned int exp_cpu_q_ceiling;
++extern unsigned int exp_tx_hardirq;
++
++/* Can be written while the driver runs */
++extern bool diag_on;
++extern bool diag_xmit_time;
++extern unsigned int exp_tx_budget;
++extern unsigned int exp_rx_drop_port;
++extern unsigned int exp_rx_delay_us;
++extern unsigned int exp_fill_lag;
++extern unsigned int exp_cons_lag;
++extern unsigned int exp_fill_every;
++extern unsigned int exp_tx_scan_extra;
++extern unsigned int exp_hardirq_budget;
++extern unsigned int exp_rx_swq;
++
++/* What one poll of an RX ring or of a TX completion ring did */
++struct diag_poll {
++	u64 start;		/* ns, monotonic */
++	u32 dur;		/* ns */
++	u32 since_irq;		/* ns from the interrupt that asked for it; ~0: none did */
++	u32 gap;		/* ns since the previous poll of this ring ended */
++	u32 xmit_ns;		/* ns this CPU spent in the driver's xmit meanwhile */
++	u16 n;			/* slots looked at */
++	u16 frames;		/* RX: frames handed up or dropped whole */
++	u16 fwd;		/* RX: of those, not for an address of the router */
++	u16 loc;		/* RX: for the router, with payload */
++	u16 ack;		/* RX: for the router, TCP without payload */
++	u16 scan;		/* RX: store slots walked to find pages */
++	u16 q_in;		/* slots waiting when the poll began */
++	u16 q_out;		/* slots waiting when it ended */
++	u16 xmit_loc;		/* packets with a socket this CPU sent meanwhile */
++	u16 xmit_fwd;		/* packets without one */
++	u16 woken;		/* TX: queues woken */
++	u16 refill;		/* RX: new buffers put into the fill ring */
++	u16 p_in;		/* the ring's producer and consumer positions */
++	u16 c_in;		/* when the poll began, */
++	u16 p_out;		/* and when it ended */
++	u16 c_out;
++	u16 after_loc;		/* TX: packets with a socket this CPU sent from
++				 * softirqs since this ring's poll before
++				 */
++	u8 cpu;
++	u8 flags;
++	u32 pid;
++};
++
++#define DIAG_POLL_SOFTIRQ	BIT(0)	/* ran in a softirq, not in a NAPI thread */
++#define DIAG_POLL_KSOFTIRQD	BIT(1)	/* that softirq ran in ksoftirqd */
++#define DIAG_POLL_BUDGET	BIT(2)	/* used up its budget */
++#define DIAG_POLL_TX		BIT(3)	/* a TX completion ring's */
++#define DIAG_POLL_HARDIRQ	BIT(4)	/* ran in the interrupt handler */
++
++#define DIAG_HIST	24
++
++/* Totals of all polls of one ring since the last reset, and the last
++ * diag_cap of them
++ */
++struct diag_ring {
++	struct diag_poll *rec;
++	u64 polls;
++	u64 dur;
++	u64 n;
++	u64 frames;
++	u64 fwd;
++	u64 loc;
++	u64 ack;
++	u64 scan;
++	u64 scans;
++	u64 dropped;
++	u64 xmit_loc;
++	u64 xmit_fwd;
++	u64 xmit_ns;
++	u64 woken;
++	u64 budget;
++	u64 from_irq;
++	u64 irqs;
++	/* exp_rx_hardirq: frames handed to the stack from the software queue,
++	 * frames that did not fit into it, pages that could not be given back
++	 */
++	u64 swq_done;
++	u64 swq_drop;
++	u64 leaked;
++	u64 hist_since_irq[DIAG_HIST];
++	u64 hist_gap[DIAG_HIST];
++	u64 hist_n[DIAG_HIST];
++	u64 hist_q[DIAG_HIST];
++	u64 irq_ts;
++	u64 last_end;
++	/* The poll in progress */
++	struct diag_poll cur;
++	u64 cur_xmit_loc;
++	u64 cur_xmit_fwd;
++	u64 cur_xmit_ns;
++	u64 soft_loc_at_end;
++	u8 saved_in_poll;
++};
++
++static inline u64 diag_now(void)
++{
++	return ktime_get_mono_fast_ns();
++}
++
++int ppe_diag_init(struct ppe_device *ppe_dev, void __iomem *base);
++void ppe_diag_exit(struct ppe_device *ppe_dev);
++void ppe_diag_quiesce(void);
++void ppe_diag_threads(struct ppe_device *ppe_dev);
++
++void diag_irq(struct edma_ring *ring);
++void diag_poll_begin(struct edma_ring *ring, bool tx);
++void diag_poll_end(struct edma_ring *ring, int done, int budget, u16 q_out);
++bool diag_rx_frame(struct edma_ring *ring, const void *frame, unsigned int len);
++void diag_xmit_begin(struct sk_buff *skb, u64 *start, bool *local);
++void diag_xmit_end(u64 start, bool local, unsigned int len, bool busy);
++void diag_in_poll(u8 kind);
++
++#endif /* __IPQ807X_PPE_DIAG_H */
+diff -u -r -N a/ipq807x/ppe.h b/ipq807x/ppe.h
+--- a/ipq807x/ppe.h	2026-11-27 08:58:58.494472731 -0700
++++ b/ipq807x/ppe.h	2026-11-27 13:52:59.527054378 -0700
+@@ -19,6 +19,7 @@
+ #include <net/devlink.h>
+ 
+ #include "ppe_regs.h"
++#include "ppe_diag.h"
+ 
+ struct psch_tdm_entry;
+ struct bm_tdm_entry;
+@@ -188,6 +189,22 @@
+ 	char irq_name[16];
+ 	struct napi_struct napi;
+ 
++	/* E-0007 experiment only: see ppe_diag.c. RX ring: whether the
++	 * hardware has been told less than the poll did, in which case the
++	 * poll goes by prod and cons below, not by the registers.
++	 */
++	struct diag_ring diag;
++	bool diag_lagging;
++	/* RX ring, exp_fill_every: the store indices of the buffers that
++	 * have not been put back yet. exp_rx_hardirq: the frames that wait
++	 * for the poll.
++	 */
++	u16 *diag_free;
++	u16 diag_free_n;
++	u32 diag_poll_no;
++	struct sk_buff_head diag_rxq;
++	bool diag_irq_off;
++
+ 	/* RX fill ring: the page in each slot and where the pages come from.
+ 	 * The slots are filled by the RX ring's poll only.
+ 	 */
+@@ -314,6 +331,8 @@
+ struct ppe_device {
+ 	struct device *dev;
+ 	struct regmap *regmap;
++	/* E-0007 experiment only: the registers without the register map */
++	void __iomem *diag_base;
+ 	const struct ppe_soc_data *soc;
+ 
+ 	struct clk_bulk_data *clks;
+@@ -352,6 +371,29 @@
+ 	bool health_ready;
+ };
+ 
++/* E-0007 experiment only: a ring's register in a poll or in xmit, with
++ * exp_raw_io without the register map's lock
++ */
++static inline u32 edma_hot_read(struct ppe_device *ppe_dev, u32 reg)
++{
++	u32 val;
++
++	if (exp_raw_io)
++		return readl(ppe_dev->diag_base + reg);
++
++	regmap_read(ppe_dev->regmap, reg, &val);
++
++	return val;
++}
++
++static inline void edma_hot_write(struct ppe_device *ppe_dev, u32 reg, u32 val)
++{
++	if (exp_raw_io)
++		writel(val, ppe_dev->diag_base + reg);
++	else
++		regmap_write(ppe_dev->regmap, reg, val);
++}
++
+ extern const struct psch_tdm_data hppe_psch_tdm_data;
+ extern const struct bm_tdm_data hppe_bm_tdm_data;
+ 
+@@ -428,6 +470,7 @@
+ void edma_tx_irq_set(struct edma_ring *ring, bool enable);
+ irqreturn_t edma_tx_irq(int irq, void *ctx);
+ int edma_tx_poll(struct napi_struct *napi, int budget);
++bool edma_tx_poll_ring(struct edma_ring *cmpl_ring, int budget, int *done);
+ void edma_tx_flush(struct ppe_device *ppe_dev, struct net_device *netdev,
+ 		   unsigned int queue);
+ netdev_tx_t edma_xmit(struct ppe_device *ppe_dev, struct net_device *netdev,
+diff -u -r -N a/ipq807x/ppe_netdev.c b/ipq807x/ppe_netdev.c
+--- a/ipq807x/ppe_netdev.c	2026-11-27 08:58:58.494532647 -0700
++++ b/ipq807x/ppe_netdev.c	2026-11-27 13:52:59.526694739 -0700
+@@ -18,8 +18,8 @@
+  * driver's alone, long enough for the hardware, with room in front for the
+  * pre-header. Then it goes into the TX ring of its TX queue.
+  */
+-static netdev_tx_t ppe_netdev_xmit(struct sk_buff *skb,
+-				   struct net_device *netdev)
++static netdev_tx_t ppe_netdev_xmit_one(struct sk_buff *skb,
++				       struct net_device *netdev)
+ {
+ 	struct ppe_port *port = netdev_priv(netdev);
+ 	struct ppe_device *ppe_dev = port->ppe_dev;
+@@ -53,6 +53,24 @@
+ 	return NETDEV_TX_OK;
+ }
+ 
++/* E-0007 experiment only: note from where the packet is sent and how long
++ * the driver takes over it
++ */
++static netdev_tx_t ppe_netdev_xmit(struct sk_buff *skb,
++				   struct net_device *netdev)
++{
++	unsigned int len = skb->len;
++	netdev_tx_t ret;
++	bool local;
++	u64 start;
++
++	diag_xmit_begin(skb, &start, &local);
++	ret = ppe_netdev_xmit_one(skb, netdev);
++	diag_xmit_end(start, local, len, ret == NETDEV_TX_BUSY);
++
++	return ret;
++}
++
+ /* The link is only worked on between open and stop: phylink_start() runs the
+  * interface configuration and then waits for the PHY, phylink_stop() takes
+  * the link down first.

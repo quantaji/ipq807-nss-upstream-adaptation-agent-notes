@@ -1,0 +1,287 @@
+diff -u -r a/ipq807x/edma.c b/ipq807x/edma.c
+--- a/ipq807x/edma.c	2026-11-21 18:51:40.876496219 -0700
++++ b/ipq807x/edma.c	2026-11-21 18:51:40.895530470 -0700
+@@ -18,6 +18,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/if_vlan.h>
+ #include <linux/interrupt.h>
++#include <linux/module.h>
+ #include <linux/netdevice.h>
+ #include <linux/of.h>
+ #include <linux/of_irq.h>
+@@ -27,6 +28,73 @@
+ #include "ppe.h"
+ #include "edma_regs.h"
+ 
++/* E-0006 experiment only. With none of the parameters given the module does
++ * what the driver does.
++ *
++ * Given when the module is loaded:
++ * exp_no_fc: 1 turns flow control off for the eight buffer manager ports on
++ * the CPU side, so that what the host sends is not held back.
++ * exp_tx_thread: 1 polls the TX completion rings in threads, like the RX
++ * rings.
++ * exp_rx_mod, exp_tx_mod: what is written to the moderation timers of the RX
++ * rings and of the TX completion rings.
++ * exp_maxframe: 1 lets frames of up to 16383 bytes through and an MTU of up
++ * to 16357 be set, with the 10G MAC's receive watchdog off.
++ *
++ * Can be written while the driver runs:
++ * exp_fail_alloc: 1 treats every attempt to get a new page in the RX poll as
++ * failed.
++ * exp_starve_ring: the RX ring of that index hands its frames up but puts no
++ * buffer back, so its fill ring drains; -1 for none.
++ * exp_bad_page: 1 makes the RX poll treat the next page as not in the store,
++ * once.
++ * exp_bad_cmpl: 1 makes the TX completion poll read the next completion as
++ * naming a slot that is not there, once.
++ * exp_misc_stat: what is written goes to the error status register.
++ */
++unsigned int exp_no_fc;
++module_param(exp_no_fc, uint, 0444);
++unsigned int exp_tx_thread;
++module_param(exp_tx_thread, uint, 0444);
++unsigned int exp_rx_mod = EDMA_RX_MOD_TIMER_INIT;
++module_param(exp_rx_mod, uint, 0444);
++unsigned int exp_tx_mod = EDMA_TX_MOD_TIMER;
++module_param(exp_tx_mod, uint, 0444);
++unsigned int exp_maxframe;
++module_param(exp_maxframe, uint, 0444);
++bool exp_fail_alloc;
++module_param(exp_fail_alloc, bool, 0644);
++int exp_starve_ring = -1;
++module_param(exp_starve_ring, int, 0644);
++unsigned int exp_bad_page;
++module_param(exp_bad_page, uint, 0644);
++unsigned int exp_bad_cmpl;
++module_param(exp_bad_cmpl, uint, 0644);
++
++static struct ppe_device *exp_ppe_dev;
++
++static int exp_misc_stat_set(const char *val, const struct kernel_param *kp)
++{
++	u32 stat;
++	int ret;
++
++	ret = kstrtou32(val, 0, &stat);
++	if (ret)
++		return ret;
++	if (!exp_ppe_dev)
++		return -ENODEV;
++
++	regmap_write(exp_ppe_dev->regmap,
++		     EDMA_BASE_OFFSET + EDMA_REG_MISC_INT_STAT, stat);
++
++	return 0;
++}
++
++static const struct kernel_param_ops exp_misc_stat_ops = {
++	.set = exp_misc_stat_set,
++};
++module_param_cb(exp_misc_stat, &exp_misc_stat_ops, NULL, 0200);
++
+ /* Bring the whole EDMA to a known state: reset it, mask every ring
+  * interrupt, switch every ring and the block itself off, and write the two
+  * settings that are not a ring's. This is the one place that touches rings
+@@ -654,6 +722,8 @@
+ 	}
+ 	strscpy(edma->tx_napi_dev->name, "edma_tx",
+ 		sizeof(edma->tx_napi_dev->name));
++	if (exp_tx_thread)
++		netif_threaded_enable(edma->tx_napi_dev);
+ 
+ 	for (i = 0; i < edma->num_rx; i++)
+ 		netif_napi_add(edma->rx_napi_dev, &edma->rxdesc[i].napi,
+@@ -743,6 +813,7 @@
+ 		goto err_sys_clk;
+ 
+ 	edma->num_rx = ppe_dev->num_rx_groups;
++	exp_ppe_dev = ppe_dev;
+ 	spin_lock_init(&edma->misc_lock);
+ 	INIT_WORK(&edma->fault_work, edma_fault_work);
+ 
+@@ -843,6 +914,7 @@
+ 
+ 	edma_irq_free(ppe_dev);
+ 	cancel_work_sync(&edma->fault_work);
++	exp_ppe_dev = NULL;
+ 
+ 	edma_host_rings_stop(ppe_dev);
+ 
+diff -u -r a/ipq807x/edma_rx.c b/ipq807x/edma_rx.c
+--- a/ipq807x/edma_rx.c	2026-11-21 18:51:40.876523704 -0700
++++ b/ipq807x/edma_rx.c	2026-11-21 18:51:40.895586394 -0700
+@@ -242,7 +242,7 @@
+ 
+ 		regmap_write(regmap,
+ 			     EDMA_BASE_OFFSET + EDMA_REG_RX_MOD_TIMER(rx->id),
+-			     EDMA_RX_MOD_TIMER_INIT);
++			     exp_rx_mod);
+ 		regmap_write(regmap,
+ 			     EDMA_BASE_OFFSET + EDMA_REG_RX_INT_CTRL(rx->id),
+ 			     0x2);
+@@ -362,8 +362,13 @@
+ 					   min_t(u32, EDMA_PREHDR_SIZE + pkt_len,
+ 						 ppe_dev->edma.rx_buffer_size));
+ 
+-		store_idx = edma_rx_page_take(fill, page,
+-					      le32_to_cpu(rxph->opaque));
++		if (exp_bad_page) {
++			exp_bad_page = 0;
++			store_idx = -1;
++		} else {
++			store_idx = edma_rx_page_take(fill, page,
++						      le32_to_cpu(rxph->opaque));
++		}
+ 		if (unlikely(store_idx < 0)) {
+ 			/* It may belong to a packet already, so it can
+ 			 * neither be used nor given back
+@@ -379,6 +384,10 @@
+ 		}
+ 
+ 		new_page = page_pool_dev_alloc_pages(fill->page_pool);
++		if (exp_fail_alloc && new_page) {
++			page_pool_put_full_page(fill->page_pool, new_page, true);
++			new_page = NULL;
++		}
+ 		if (unlikely(!new_page)) {
+ 			/* No page to replace this one with: the frame goes
+ 			 * and the page goes back to the hardware as it is.
+@@ -397,8 +406,12 @@
+ 			goto drop_frame;
+ 		}
+ 
+-		edma_rx_fill_slot(fill, new_page, fill_prod, store_idx);
+-		fill_prod = (fill_prod + 1) & (fill->count - 1);
++		if (exp_starve_ring == ring - ppe_dev->edma.rxdesc) {
++			page_pool_put_full_page(fill->page_pool, new_page, true);
++		} else {
++			edma_rx_fill_slot(fill, new_page, fill_prod, store_idx);
++			fill_prod = (fill_prod + 1) & (fill->count - 1);
++		}
+ 
+ 		/* The rest of a frame that is being dropped */
+ 		if (unlikely(ring->frame_drop)) {
+@@ -533,7 +546,8 @@
+ 		}
+ 		dev_warn_ratelimited(ring->ppe_dev->dev,
+ 				     "RX fill ring %u is empty\n", fill->id);
+-		edma_rx_fill(fill);
++		if (exp_starve_ring != ring - ring->ppe_dev->edma.rxdesc)
++			edma_rx_fill(fill);
+ 		return budget;
+ 	}
+ 	if (fill->fill_empty) {
+diff -u -r a/ipq807x/edma_tx.c b/ipq807x/edma_tx.c
+--- a/ipq807x/edma_tx.c	2026-11-21 18:51:40.885477324 -0700
++++ b/ipq807x/edma_tx.c	2026-11-21 18:51:40.895616230 -0700
+@@ -230,7 +230,7 @@
+ 			     EDMA_BASE_OFFSET +
+ 			     EDMA_REG_TX_MOD_TIMER(soc->edma_tx_int_base,
+ 						   ring->id),
+-			     EDMA_TX_MOD_TIMER);
++			     exp_tx_mod);
+ 		regmap_write(regmap,
+ 			     EDMA_BASE_OFFSET +
+ 			     EDMA_REG_TX_INT_CTRL(soc->edma_tx_int_base,
+@@ -459,6 +459,11 @@
+ 
+ 		ring = ring_id < ARRAY_SIZE(edma->txdesc) ?
+ 		       &edma->txdesc[ring_id] : NULL;
++		if (exp_bad_cmpl && ring) {
++			exp_bad_cmpl = 0;
++			slot = ring->count;
++			opaque = ring_id << EDMA_TX_OPAQUE_RING_SHIFT | slot;
++		}
+ 		skb = ring && ring->skb_store && slot < ring->count ?
+ 		      ring->skb_store[slot] : NULL;
+ 		if (unlikely(!skb)) {
+diff -u -r a/ipq807x/ppe_config.c b/ipq807x/ppe_config.c
+--- a/ipq807x/ppe_config.c	2026-11-21 18:51:40.886393118 -0700
++++ b/ipq807x/ppe_config.c	2026-11-21 18:51:40.895709512 -0700
+@@ -287,7 +287,8 @@
+ 	int i;
+ 
+ 	for (i = 0; i < PPE_BM_PORTS; i++) {
+-		bool fc_en = i < PPE_BM_PHY_START || i > d->bm_phy_end;
++		bool fc_en = (i < PPE_BM_PHY_START && !exp_no_fc) ||
++			     i > d->bm_phy_end;
+ 
+ 		regmap_write(ppe_dev->regmap, PPE_BM_FC_MODE(i),
+ 			     fc_en ? PPE_BM_FC_EN : 0);
+@@ -859,7 +860,7 @@
+ 		 * port is given later.
+ 		 */
+ 		if (i == QCA_PPE_CPU_PORT)
+-			frame_size = soc->max_mtu + ETH_HLEN + 2 * VLAN_HLEN;
++			frame_size = EXP_MAX_MTU(soc) + ETH_HLEN + 2 * VLAN_HLEN;
+ 		else
+ 			frame_size = PPE_DEFAULT_MTU + 2 * VLAN_HLEN;
+ 
+diff -u -r a/ipq807x/ppe.h b/ipq807x/ppe.h
+--- a/ipq807x/ppe.h	2026-11-21 18:51:40.886420101 -0700
++++ b/ipq807x/ppe.h	2026-11-21 18:51:40.895410385 -0700
+@@ -386,6 +386,20 @@
+ void ppe_netdev_unregister_all(struct ppe_device *ppe_dev);
+ void ppe_netdev_destroy_all(struct ppe_device *ppe_dev);
+ 
++/* E-0006 experiment only: see edma.c */
++extern unsigned int exp_no_fc;
++extern unsigned int exp_tx_thread;
++extern unsigned int exp_rx_mod;
++extern unsigned int exp_tx_mod;
++extern unsigned int exp_maxframe;
++extern bool exp_fail_alloc;
++extern int exp_starve_ring;
++extern unsigned int exp_bad_page;
++extern unsigned int exp_bad_cmpl;
++
++#define EXP_MAX_FRAME		(exp_maxframe ? 16383 : PPE_MAX_FRAME_SIZE)
++#define EXP_MAX_MTU(soc)	(exp_maxframe ? 16357 : (soc)->max_mtu)
++
+ /* ppe_devlink.c */
+ int ppe_devlink_alloc(struct ppe_device *ppe_dev);
+ int ppe_devlink_port_register(struct ppe_port *port);
+diff -u -r a/ipq807x/ppe_netdev.c b/ipq807x/ppe_netdev.c
+--- a/ipq807x/ppe_netdev.c	2026-11-21 18:51:40.886447150 -0700
++++ b/ipq807x/ppe_netdev.c	2026-11-21 18:51:40.895736509 -0700
+@@ -259,7 +259,7 @@
+ 	netdev->ethtool_ops = &ppe_ethtool_ops;
+ 	netdev->stat_ops = &ppe_netdev_stat_ops;
+ 	netdev->needed_headroom = EDMA_PREHDR_SIZE;
+-	netdev->max_mtu = ppe_dev->soc->max_mtu;
++	netdev->max_mtu = EXP_MAX_MTU(ppe_dev->soc);
+ 
+ 	ret = of_get_ethdev_address(np, netdev);
+ 	if (ret == -EPROBE_DEFER) {
+diff -u -r a/ipq807x/ppe_port.c b/ipq807x/ppe_port.c
+--- a/ipq807x/ppe_port.c	2026-11-21 18:51:40.886476727 -0700
++++ b/ipq807x/ppe_port.c	2026-11-21 18:51:40.895664101 -0700
+@@ -90,14 +90,14 @@
+ 	regmap_update_bits(regmap, PPE_GMAC_CTRL2(gmac),
+ 			   PPE_GMAC_CTRL2_MAXFR | PPE_GMAC_CTRL2_CRS_SEL |
+ 			   PPE_GMAC_CTRL2_TX_THD,
+-			   FIELD_PREP(PPE_GMAC_CTRL2_MAXFR, PPE_MAX_FRAME_SIZE) |
++			   FIELD_PREP(PPE_GMAC_CTRL2_MAXFR, EXP_MAX_FRAME) |
+ 			   FIELD_PREP(PPE_GMAC_CTRL2_TX_THD, 1));
+ 
+ 	regmap_update_bits(regmap, PPE_GMAC_DBG_CTRL(gmac),
+ 			   PPE_GMAC_DBG_CTRL_HIHG_IPG,
+ 			   FIELD_PREP(PPE_GMAC_DBG_CTRL_HIHG_IPG, 0xc));
+ 
+-	regmap_write(regmap, PPE_GMAC_JUMBO_SIZE(gmac), PPE_MAX_FRAME_SIZE);
++	regmap_write(regmap, PPE_GMAC_JUMBO_SIZE(gmac), EXP_MAX_FRAME);
+ 
+ 	regmap_write(regmap, PPE_GMAC_MIB_CTRL(gmac), PPE_MIB_EN);
+ }
+@@ -730,8 +730,9 @@
+ 			   PPE_XGMAC_WATCHDOG_DISABLE |
+ 			   PPE_XGMAC_GIANT_SIZE_LIMIT,
+ 			   PPE_XGMAC_GMII_MPLS_LAYER_CK |
++			   (exp_maxframe ? PPE_XGMAC_WATCHDOG_DISABLE : 0) |
+ 			   FIELD_PREP(PPE_XGMAC_GIANT_SIZE_LIMIT,
+-				      PPE_MAX_FRAME_SIZE));
++				      EXP_MAX_FRAME));
+ 
+ 	regmap_update_bits(regmap, PPE_XGMAC_PACKET_FILTER(xgmac),
+ 			   PPE_XGMAC_PROMISCUOUS |
